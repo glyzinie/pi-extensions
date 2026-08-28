@@ -74,14 +74,17 @@ function extractResults(payload: unknown): NormalizedResult[] {
   return results;
 }
 
-async function fetchWithTimeout(
+async function fetchTextWithTimeout(
   input: string,
   init: RequestInit,
   timeoutMs: number,
   outerSignal?: AbortSignal,
-): Promise<Response> {
+): Promise<{ response: Response; bodyText: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(
+    () => controller.abort(new Error(`Kagi request timed out after ${timeoutMs}ms`)),
+    timeoutMs,
+  );
 
   const abortFromOuter = () => controller.abort(outerSignal?.reason);
   if (outerSignal) {
@@ -90,7 +93,9 @@ async function fetchWithTimeout(
   }
 
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    const bodyText = await response.text();
+    return { response, bodyText };
   } finally {
     clearTimeout(timer);
     outerSignal?.removeEventListener("abort", abortFromOuter);
@@ -138,8 +143,9 @@ export default function piKagi(pi: ExtensionAPI) {
       );
 
       let response: Response;
+      let bodyText: string;
       try {
-        response = await fetchWithTimeout(
+        ({ response, bodyText } = await fetchTextWithTimeout(
           KAGI_ENDPOINT,
           {
             method: "POST",
@@ -156,14 +162,12 @@ export default function piKagi(pi: ExtensionAPI) {
           },
           REQUEST_TIMEOUT_MS,
           signal,
-        );
+        ));
       } catch (error) {
         if (signal?.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
         return textContent(`Kagi request failed: ${message}`);
       }
-
-      const bodyText = await response.text();
       if (!response.ok) {
         const body = bodyText.slice(0, MAX_ERROR_BODY_CHARS).trim();
         return textContent(
