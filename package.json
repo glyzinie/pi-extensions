@@ -1,0 +1,21 @@
+{
+  "name": "@glyzinie/pi-extensions",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "./extensions/*/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
