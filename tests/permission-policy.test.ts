@@ -118,6 +118,31 @@ describe("permission policy", () => {
     expect(external).toMatchObject({ decision: "review", route: "human", ruleId: "credential-external-tool" });
   });
 
+  test("checks cwd when an optional built-in read path is omitted", async () => {
+    const calls: Array<{ toolName: string; input: Record<string, unknown> }> = [
+      { toolName: "grep", input: { pattern: "token" } },
+      { toolName: "find", input: { pattern: "*" } },
+      { toolName: "ls", input: {} },
+    ];
+
+    for (const { toolName, input } of calls) {
+      const broad = await evaluatePolicy(request(toolName, input, homedir()), []);
+      expect(broad).toMatchObject({
+        decision: "review",
+        route: "human",
+        ruleId: "credential-read",
+        details: { target: homedir() },
+      });
+
+      const scoped = await evaluatePolicy(request(toolName, input), []);
+      expect(scoped).toMatchObject({
+        decision: "allow",
+        ruleId: "builtin-read",
+        details: { target: cwd },
+      });
+    }
+  });
+
   test("does not auto-allow temp symlinks whose canonical target is outside temp", async () => {
     const link = `${root}/temp-link`;
     symlinkSync(`${homedir()}/permission-symlink-target-${process.pid}`, link);

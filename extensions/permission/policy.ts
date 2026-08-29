@@ -265,8 +265,8 @@ function isBashDeletion(command: BashCommand): boolean {
 }
 
 async function evaluateReadTool(request: PermissionRequest): Promise<PermissionPolicyResult> {
-  const rawPath = pathFromInput(request.input);
-  if (!rawPath) return allow("builtin-read", `${request.toolName} is read-only`);
+  // grep, find, and ls use cwd when path is omitted, so assess that effective target too.
+  const rawPath = pathFromInput(request.input) ?? request.cwd;
 
   let target: PathIdentity;
   try {
