@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { fetchTextWithLimits, truncateToolOutput } from "../http.ts";
+import { fetchTextWithLimits } from "../_shared/http.ts";
+import { truncateJinaMarkdown } from "./output.ts";
 
 const JINA_READER_BASE = "https://r.jina.ai/";
 const DEFAULT_MAX_CHARS = 50_000;
@@ -157,7 +158,7 @@ export default function piJina(pi: ExtensionAPI) {
         );
       }
 
-      const output = truncateToolOutput(lines.join("\n"));
+      const output = truncateJinaMarkdown(lines.join("\n"));
 
       return {
         content: [{ type: "text" as const, text: output.text }],

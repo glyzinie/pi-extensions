@@ -1,9 +1,3 @@
-import {
-  DEFAULT_MAX_BYTES,
-  DEFAULT_MAX_LINES,
-  truncateHead,
-} from "@earendil-works/pi-coding-agent";
-
 export interface FetchTextOptions {
   timeoutMs: number;
   maxBytes: number;
@@ -11,17 +5,43 @@ export interface FetchTextOptions {
   signal?: AbortSignal;
 }
 
-async function readResponseText(response: Response, maxBytes: number): Promise<string> {
-  const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-    if (response.body) await response.body.cancel().catch(() => undefined);
-    throw new Error(`response body exceeds ${maxBytes} bytes`);
+export class ResponseBodyTooLargeError extends Error {
+  readonly maxBytes: number;
+
+  constructor(maxBytes: number) {
+    super(`response body exceeds ${maxBytes} bytes`);
+    this.name = "ResponseBodyTooLargeError";
+    this.maxBytes = maxBytes;
+  }
+}
+
+export class RequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number, message: string) {
+    super(message);
+    this.name = "RequestTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+async function readResponseText(
+  response: Response,
+  maxBytes: number,
+): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const declaredLength = Number(contentLength);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      if (response.body) await response.body.cancel().catch(() => undefined);
+      throw new ResponseBodyTooLargeError(maxBytes);
+    }
   }
 
   if (!response.body) {
     const text = await response.text();
     if (Buffer.byteLength(text, "utf8") > maxBytes) {
-      throw new Error(`response body exceeds ${maxBytes} bytes`);
+      throw new ResponseBodyTooLargeError(maxBytes);
     }
     return text;
   }
@@ -39,7 +59,7 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
       receivedBytes += value.byteLength;
       if (receivedBytes > maxBytes) {
         await reader.cancel().catch(() => undefined);
-        throw new Error(`response body exceeds ${maxBytes} bytes`);
+        throw new ResponseBodyTooLargeError(maxBytes);
       }
       chunks.push(decoder.decode(value, { stream: true }));
     }
@@ -50,32 +70,21 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
   }
 }
 
-export function truncateToolOutput(text: string): {
-  text: string;
-  truncated: boolean;
-} {
-  const notice = `[Output truncated at ${DEFAULT_MAX_BYTES / 1024}KB or ${DEFAULT_MAX_LINES} lines.]`;
-  const suffix = `\n\n${notice}`;
-  const truncation = truncateHead(text, {
-    maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(suffix, "utf8"),
-    maxLines: DEFAULT_MAX_LINES - 2,
-  });
-
-  return truncation.truncated
-    ? { text: truncation.content + suffix, truncated: true }
-    : { text, truncated: false };
-}
-
 export async function fetchTextWithLimits(
-  input: string,
+  input: string | URL,
   init: RequestInit,
   options: FetchTextOptions,
 ): Promise<{ response: Response; bodyText: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error(options.timeoutMessage)),
+  const timeoutError = new RequestTimeoutError(
     options.timeoutMs,
+    options.timeoutMessage,
   );
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(timeoutError);
+  }, options.timeoutMs);
 
   const abortFromOuter = () => controller.abort(options.signal?.reason);
   if (options.signal) {
@@ -87,6 +96,9 @@ export async function fetchTextWithLimits(
     const response = await fetch(input, { ...init, signal: controller.signal });
     const bodyText = await readResponseText(response, options.maxBytes);
     return { response, bodyText };
+  } catch (error) {
+    if (timedOut && !options.signal?.aborted) throw timeoutError;
+    throw error;
   } finally {
     clearTimeout(timer);
     options.signal?.removeEventListener("abort", abortFromOuter);

@@ -1,7 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { fetchTextWithLimits, truncateToolOutput } from "../http.ts";
+import { fetchTextWithLimits } from "../_shared/http.ts";
+import {
+  formatKagiOutput,
+  type KagiResult,
+} from "./output.ts";
 
 const KAGI_ENDPOINT = "https://kagi.com/api/v1/search";
 const DEFAULT_LIMIT = 10;
@@ -14,13 +18,6 @@ const MAX_ERROR_BODY_CHARS = 2_000;
 type SearchParams = {
   query: string;
   limit?: number;
-};
-
-type NormalizedResult = {
-  title: string;
-  url: string;
-  snippet?: string;
-  published?: string;
 };
 
 function textContent(text: string) {
@@ -36,7 +33,7 @@ function cleanInline(value: unknown): string | undefined {
   return cleaned || undefined;
 }
 
-function extractResults(payload: unknown): NormalizedResult[] {
+function extractResults(payload: unknown): KagiResult[] {
   if (!payload || typeof payload !== "object") return [];
 
   const root = payload as Record<string, unknown>;
@@ -55,7 +52,7 @@ function extractResults(payload: unknown): NormalizedResult[] {
     candidates = data;
   }
 
-  const results: NormalizedResult[] = [];
+  const results: KagiResult[] = [];
 
   for (const item of candidates) {
     if (!item || typeof item !== "object") continue;
@@ -171,17 +168,7 @@ export default function piKagi(pi: ExtensionAPI) {
         return textContent(`No Kagi search results found for: ${query}`);
       }
 
-      const lines: string[] = [`Kagi search results for: ${query}`, ""];
-
-      for (const [index, result] of results.entries()) {
-        lines.push(`${index + 1}. ${result.title}`);
-        lines.push(`   URL: ${result.url}`);
-        if (result.published) lines.push(`   Published: ${result.published}`);
-        if (result.snippet) lines.push(`   ${result.snippet}`);
-        lines.push("");
-      }
-
-      const output = truncateToolOutput(lines.join("\n").trimEnd());
+      const output = formatKagiOutput(query, results);
 
       return {
         content: [{ type: "text" as const, text: output.text }],
@@ -189,6 +176,7 @@ export default function piKagi(pi: ExtensionAPI) {
           provider: "kagi",
           query,
           count: results.length,
+          shown: output.shown,
           results,
           truncated: output.truncated,
         },

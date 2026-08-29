@@ -1,8 +1,16 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+import {
+  fetchTextWithLimits,
+  RequestTimeoutError,
+  ResponseBodyTooLargeError,
+} from "../_shared/http.ts";
 
 const SEARCH_URL = "https://grep.app/api/search";
 const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MESSAGE = `grep.app request timed out after ${REQUEST_TIMEOUT_MS}ms`;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_LIMIT = 5;
 const MAX_SNIPPET_CHARS = 1_500;
 const MAX_OUTPUT_CHARS = 12_000;
@@ -59,30 +67,6 @@ function snippetToText(snippet: string): string {
     .trim();
 }
 
-function combinedSignal(signal?: AbortSignal): {
-  signal: AbortSignal;
-  cleanup: () => void;
-} {
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(new Error("grep.app request timed out")),
-    REQUEST_TIMEOUT_MS,
-  );
-
-  const onAbort = () => controller.abort(signal?.reason);
-
-  if (signal?.aborted) onAbort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
-
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", onAbort);
-    },
-  };
-}
-
 async function fetchSearch(
   url: URL,
   signal?: AbortSignal,
@@ -90,19 +74,25 @@ async function fetchSearch(
   let lastError: unknown;
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const abort = combinedSignal(signal);
-
     try {
-      const response = await fetch(url, {
-        headers: {
-          accept: "application/json",
-          "user-agent": "pi-grepapp/0.2",
+      const { response, bodyText } = await fetchTextWithLimits(
+        url.toString(),
+        {
+          headers: {
+            accept: "application/json",
+            "user-agent": "pi-grepapp/0.2",
+          },
         },
-        signal: abort.signal,
-      });
+        {
+          timeoutMs: REQUEST_TIMEOUT_MS,
+          maxBytes: MAX_RESPONSE_BYTES,
+          timeoutMessage: REQUEST_TIMEOUT_MESSAGE,
+          signal,
+        },
+      );
 
       if (!response.ok) {
-        const body = (await response.text()).slice(0, 500);
+        const body = bodyText.slice(0, 500);
         const error = new Error(
           `grep.app HTTP ${response.status}${body ? `: ${body}` : ""}`,
         );
@@ -115,12 +105,17 @@ async function fetchSearch(
         throw error;
       }
 
-      return (await response.json()) as GrepAppResponse;
+      try {
+        return JSON.parse(bodyText) as GrepAppResponse;
+      } catch {
+        throw new Error("grep.app returned an invalid JSON response");
+      }
     } catch (error) {
-      if (signal?.aborted || abort.signal.aborted || attempt === 1) throw error;
+      const isBoundFailure =
+        error instanceof RequestTimeoutError ||
+        error instanceof ResponseBodyTooLargeError;
+      if (signal?.aborted || isBoundFailure || attempt === 1) throw error;
       lastError = error;
-    } finally {
-      abort.cleanup();
     }
   }
 
