@@ -1,5 +1,12 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  truncateHead,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+
+const MAX_ANSWER_BYTES = 12 * 1024;
+const MAX_ANSWER_LINES = 498;
+const ANSWER_TRUNCATED_SUFFIX = "\n\n[Answer truncated.]";
 
 const AskParams = Type.Object({
   questions: Type.Array(
@@ -31,6 +38,17 @@ function otherLabel(options: string[]): string {
   return label;
 }
 
+function boundedAnswer(value: string): string {
+  const answer = value.trim() || "(blank)";
+  const output = truncateHead(answer, {
+    maxBytes: MAX_ANSWER_BYTES - Buffer.byteLength(ANSWER_TRUNCATED_SUFFIX),
+    maxLines: MAX_ANSWER_LINES - 2,
+  });
+  return output.truncated
+    ? output.content + ANSWER_TRUNCATED_SUFFIX
+    : answer;
+}
+
 function askResult(answers: string[], cancelled: boolean) {
   const lines = answers.map((answer, index) => `Q${index + 1}: ${answer}`);
   if (cancelled) lines.push("User cancelled.");
@@ -46,7 +64,7 @@ export default function piAsk(pi: ExtensionAPI) {
     name: "ask",
     label: "Ask",
     description:
-      "Ask the user 1-4 questions. options=[] is free text; otherwise choices plus Other are shown.",
+      "Ask the user 1-4 questions. options=[] is free text; otherwise choices plus Other are shown. Output is capped at 50KB or 2000 lines.",
     parameters: AskParams,
     executionMode: "sequential",
 
@@ -80,7 +98,7 @@ export default function piAsk(pi: ExtensionAPI) {
         }
 
         if (answer === undefined) return askResult(answers, true);
-        answers.push(answer.trim() || "(blank)");
+        answers.push(boundedAnswer(answer));
       }
 
       return askResult(answers, false);

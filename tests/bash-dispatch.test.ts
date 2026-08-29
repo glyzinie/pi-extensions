@@ -99,7 +99,7 @@ describe("bash dispatcher", () => {
     ).rejects.toThrow("sandbox is not initialized");
   });
 
-  test("uses one static sandbox and keeps the session shell settings snapshot", async () => {
+  test("sandboxes only the Bash tool and keeps the session settings snapshot", async () => {
     const root = "/tmp/pi-bash-dispatch-test";
     const agentDir = `${root}/agent`;
     const cwd = `${root}/workspace`;
@@ -146,7 +146,7 @@ describe("bash dispatcher", () => {
       { type: "user_bash", command: "pwd", cwd, excludeFromContext: false },
       ctx,
     );
-    expect(typeof (userBash as { operations: { exec?: unknown } }).operations.exec).toBe("function");
+    expect(userBash).toBeUndefined();
 
     await testHarness.emitLifecycle("session_shutdown", { type: "session_shutdown" }, ctx);
     expect(testHarness.closeCount).toBe(1);

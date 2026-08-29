@@ -66,13 +66,6 @@ export default function bashExtension(
     },
   });
 
-  // User-entered !/!! commands use the same static filesystem boundary.
-  pi.on("user_bash", () => {
-    if (platform !== "darwin") return undefined;
-    if (!sandbox) throw new Error("macOS filesystem sandbox is not initialized for bash");
-    return { operations: sandbox.operations };
-  });
-
   pi.on("session_start", (_event, ctx) => {
     sandbox?.close();
     sandbox = undefined;

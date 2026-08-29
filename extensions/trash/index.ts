@@ -11,6 +11,15 @@ function isInside(path: string, root: string): boolean {
     (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
+export function selectTopLevelTrashEntries(
+  entries: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const values = [...entries];
+  return new Map(values.filter(([target]) =>
+    !values.some(([parent]) => parent !== target && isInside(target, parent))
+  ));
+}
+
 export function validateTrashPath(input: string, workspace: string): string {
   const value = input.startsWith("@") ? input.slice(1) : input;
   const target = resolve(workspace, value);
@@ -58,7 +67,8 @@ export default function trashExtension(pi: ExtensionAPI) {
         if (!entries.has(target)) entries.set(target, input);
       }
 
-      const targets = [...entries.keys()];
+      const selectedEntries = selectTopLevelTrashEntries(entries);
+      const targets = [...selectedEntries.keys()];
       const result = await pi.exec(TRASH, ["-s", ...targets], {
         cwd: workspace,
         signal,
@@ -70,11 +80,15 @@ export default function trashExtension(pi: ExtensionAPI) {
         throw new Error(result.stderr.trim() || `trash exited with code ${result.code}`);
       }
 
-      const moved = [...entries.values()];
+      const moved = [...selectedEntries.values()];
       const shown = moved.slice(0, 10);
       const omitted = moved.length - shown.length;
+      const covered = entries.size - selectedEntries.size;
       const summary = shown.map((path) => `- ${path}`).join("\n") +
-        (omitted > 0 ? `\n- …and ${omitted} more` : "");
+        (omitted > 0 ? `\n- …and ${omitted} more` : "") +
+        (covered > 0
+          ? `\n(${covered} nested path${covered === 1 ? "" : "s"} covered by a parent path.)`
+          : "");
 
       return {
         content: [{ type: "text" as const, text: `Moved to Trash:\n${summary}` }],

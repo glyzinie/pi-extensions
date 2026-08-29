@@ -10,7 +10,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { validateTrashPath } from "../extensions/trash/index.ts";
+import {
+  selectTopLevelTrashEntries,
+  validateTrashPath,
+} from "../extensions/trash/index.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -45,6 +48,23 @@ describe("validateTrashPath", () => {
     expect(() => validateTrashPath("../outside", workspace)).toThrow(
       "Refusing to trash path outside workspace",
     );
+  });
+
+  test("collapses nested targets under their selected parent", () => {
+    const workspace = temporaryRoot("pi-trash-workspace");
+    const parent = join(workspace, "dir");
+    const child = join(parent, "file.txt");
+    const other = join(workspace, "other.txt");
+    const selected = selectTopLevelTrashEntries(new Map([
+      [child, "dir/file.txt"],
+      [other, "other.txt"],
+      [parent, "dir"],
+    ]));
+
+    expect([...selected]).toEqual([
+      [other, "other.txt"],
+      [parent, "dir"],
+    ]);
   });
 
   test("allows a final symlink but rejects a symlinked parent outside workspace", () => {

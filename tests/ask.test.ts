@@ -55,6 +55,39 @@ describe("ask", () => {
     });
   });
 
+  test("caps free-text answers within the tool output budget", async () => {
+    const tool = askTool();
+    const inputs = [
+      "x".repeat(20_000),
+      Array.from({ length: 1_000 }, () => "line").join("\n"),
+    ];
+
+    const result = await tool.execute(
+      "ask-bounded",
+      {
+        questions: [
+          { prompt: "Bytes", options: [] },
+          { prompt: "Lines", options: [] },
+        ],
+      },
+      undefined,
+      undefined,
+      {
+        hasUI: true,
+        ui: { async input() { return inputs.shift(); } },
+      },
+    );
+
+    const text = result.content[0].text;
+    expect(text.match(/\[Answer truncated\.\]/g)).toHaveLength(2);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(50 * 1024);
+    expect(text.split("\n").length).toBeLessThanOrEqual(2_000);
+    for (const answer of result.details.answers) {
+      expect(Buffer.byteLength(answer)).toBeLessThanOrEqual(12 * 1024);
+      expect(answer.split("\n").length).toBeLessThanOrEqual(498);
+    }
+  });
+
   test("returns completed answers when a later question is cancelled", async () => {
     const tool = askTool();
     let inputCount = 0;

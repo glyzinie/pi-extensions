@@ -7,6 +7,7 @@ import {
   formatSize,
   truncateHead,
   type ExtensionAPI,
+  type LsToolDetails,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -19,8 +20,10 @@ const parameters = Type.Object({
     Type.String({ description: "Directory to list (default: current directory)" }),
   ),
   limit: Type.Optional(
-    Type.Number({
+    Type.Integer({
       description: `Maximum entries to return (default: ${DEFAULT_LIMIT}, max: ${HARD_LIMIT})`,
+      minimum: 1,
+      maximum: HARD_LIMIT,
     }),
   ),
 });
@@ -42,18 +45,6 @@ function displayEntryName(name: string): string {
   return JSON.stringify(name).slice(1, -1);
 }
 
-function normalizeLimit(limit: number | undefined): {
-  value: number;
-  clamped: boolean;
-} {
-  if (limit === undefined) return { value: DEFAULT_LIMIT, clamped: false };
-  const integer = Math.max(1, Math.floor(limit));
-  return {
-    value: Math.min(integer, HARD_LIMIT),
-    clamped: integer > HARD_LIMIT,
-  };
-}
-
 export default function lsExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "ls",
@@ -70,7 +61,7 @@ export default function lsExtension(pi: ExtensionAPI): void {
 
       const cwd = ctx?.cwd ?? process.cwd();
       const dirPath = resolvePath(path, cwd);
-      const normalized = normalizeLimit(limit);
+      const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
       let entries;
       try {
@@ -86,7 +77,7 @@ export default function lsExtension(pi: ExtensionAPI): void {
         a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
       );
 
-      const selected = entries.slice(0, normalized.value);
+      const selected = entries.slice(0, effectiveLimit);
       const lines = selected.map(
         (entry) => displayEntryName(entry.name) + (entry.isDirectory() ? "/" : ""),
       );
@@ -94,7 +85,7 @@ export default function lsExtension(pi: ExtensionAPI): void {
       if (lines.length === 0) {
         return {
           content: [{ type: "text" as const, text: "(empty directory)" }],
-          details: { total: 0, shown: 0 },
+          details: undefined,
         };
       }
 
@@ -104,19 +95,19 @@ export default function lsExtension(pi: ExtensionAPI): void {
       });
 
       const notices: string[] = [];
-      if (normalized.clamped) {
-        notices.push(`limit clamped to ${HARD_LIMIT}`);
-      }
+      const details: LsToolDetails = {};
       if (entries.length > selected.length) {
-        const next = Math.min(normalized.value * 2, HARD_LIMIT);
+        const next = Math.min(effectiveLimit * 2, HARD_LIMIT);
         notices.push(
-          next > normalized.value
+          next > effectiveLimit
             ? `${selected.length}/${entries.length} entries; use limit=${next} for more`
             : `${selected.length}/${entries.length} entries shown`,
         );
+        details.entryLimitReached = effectiveLimit;
       }
       if (truncation.truncated) {
         notices.push(`${formatSize(MAX_BYTES)} output limit reached`);
+        details.truncation = truncation;
       }
 
       const suffix = notices.length > 0 ? `\n\n[${notices.join(". ")}]` : "";
@@ -127,11 +118,7 @@ export default function lsExtension(pi: ExtensionAPI): void {
             text: truncation.content + suffix,
           },
         ],
-        details: {
-          total: entries.length,
-          shown: truncation.outputLines,
-          truncated: truncation.truncated || entries.length > selected.length,
-        },
+        details: Object.keys(details).length > 0 ? details : undefined,
       };
     },
   });
