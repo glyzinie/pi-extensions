@@ -163,11 +163,11 @@ describe("permission policy", () => {
     }
   });
 
-  test("does not blanket-deny tests and builds with implicit workspace outputs", async () => {
+  test("routes static commands with unmodeled effects to model review", async () => {
     for (const command of ["npm test", "npm run build", "cargo test"]) {
       const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
       expect(result.decision).toBe("review");
-      expect(result.ruleId).toBe("complex-shell-command");
+      expect(result.ruleId).toBe("unrecognized-shell-command");
     }
   });
 

@@ -450,8 +450,7 @@ async function evaluateBash(
     !analysis.complete ||
     analysis.dynamic ||
     analysis.opaque ||
-    analysis.background ||
-    !analysis.writeTargetsComplete
+    analysis.background
   ) {
     return review(
       "complex-shell-command",
@@ -469,9 +468,14 @@ async function evaluateBash(
 
   return review(
     "unrecognized-shell-command",
-    "shell command is not on the deterministic low-risk allowlist",
+    analysis.writeTargetsComplete
+      ? "shell command is not on the deterministic low-risk allowlist"
+      : "shell command effects are not completely modeled by the deterministic policy",
     "model-then-human",
-    { targets: writeAssessment.targets },
+    {
+      targets: writeAssessment.targets,
+      writeTargetsComplete: analysis.writeTargetsComplete,
+    },
   );
 }
 

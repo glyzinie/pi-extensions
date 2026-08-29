@@ -48,19 +48,22 @@ function projectValue(
     return "[omitted]";
   }
   state.seen.add(value);
-
-  if (Array.isArray(value)) {
-    if (value.length > MAX_ARRAY) state.unsafe = true;
-    return value.slice(0, MAX_ARRAY).map((item) => projectValue(item, state, depth + 1));
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > MAX_ARRAY) state.unsafe = true;
+      return value.slice(0, MAX_ARRAY).map((item) => projectValue(item, state, depth + 1));
+    }
+    const entries = Object.entries(value);
+    if (entries.length > MAX_KEYS) state.unsafe = true;
+    return Object.fromEntries(
+      entries.slice(0, MAX_KEYS).map(([entryKey, item]) => [
+        entryKey,
+        projectValue(item, state, depth + 1, entryKey),
+      ]),
+    );
+  } finally {
+    state.seen.delete(value);
   }
-  const entries = Object.entries(value);
-  if (entries.length > MAX_KEYS) state.unsafe = true;
-  return Object.fromEntries(
-    entries.slice(0, MAX_KEYS).map(([entryKey, item]) => [
-      entryKey,
-      projectValue(item, state, depth + 1, entryKey),
-    ]),
-  );
 }
 
 function projectBashAnalysis(data: unknown): unknown {
@@ -75,7 +78,6 @@ function projectBashAnalysis(data: unknown): unknown {
     redirects: analysis.commands?.flatMap((command) => command.redirects),
     writeTargets: analysis.writeTargets,
     writeTargetsComplete: analysis.writeTargetsComplete,
-    warnings: analysis.warnings,
   };
 }
 

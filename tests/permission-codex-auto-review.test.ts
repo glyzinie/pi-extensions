@@ -5,7 +5,9 @@ import {
   parseReviewResponse,
   resolveCodexReviewModel,
 } from "../extensions/permission-codex-auto-review/index.ts";
+import { codexAutoReviewer } from "../extensions/permission-codex-auto-review/reviewer.ts";
 import type {
+  PermissionAnalysis,
   PermissionRequest,
   PermissionReviewPolicy,
 } from "../extensions/permission/protocol.ts";
@@ -75,9 +77,88 @@ describe("Codex auto-review model resolution", () => {
   });
 });
 
+describe("Codex auto-review request", () => {
+  test("uses a reasoning summary value supported by the Codex API", async () => {
+    let completionOptions: Record<string, unknown> | undefined;
+    const model = {
+      id: "codex-auto-review",
+      name: "Codex Auto Review",
+      provider: "openai-codex",
+      api: "openai-codex-responses",
+      reasoning: true,
+      input: ["text"],
+    };
+    const ctx = {
+      modelRegistry: {
+        find: () => model,
+        getAll: () => [model],
+        complete: async (_model: unknown, _context: unknown, options: Record<string, unknown>) => {
+          completionOptions = options;
+          return {
+            role: "assistant",
+            content: [{ type: "text", text: '{"outcome":"allow"}' }],
+            stopReason: "stop",
+          };
+        },
+      },
+    } as any;
+
+    const result = await codexAutoReviewer.review(request, policy, [], ctx);
+
+    expect(result.decision).toBe("allow");
+    expect(completionOptions?.reasoningSummary).toBe("concise");
+  });
+});
+
 describe("Codex auto-review evidence", () => {
   test("projects bounded benign evidence", () => {
     const evidence = buildReviewEvidence(request, policy, []);
+    expect(evidence.safeForAutoReview).toBe(true);
+  });
+
+  test("keeps benign shared Bash analysis values eligible for auto-review", () => {
+    const warnings: string[] = [];
+    const path = {
+      raw: "output.txt",
+      value: "output.txt",
+      quoted: false,
+      expandTilde: false,
+    };
+    const analyses: PermissionAnalysis[] = [{
+      analyzer: "tree-sitter-bash",
+      kind: "bash/tree-sitter",
+      data: {
+        raw: "printf ok > output.txt",
+        complete: true,
+        dynamic: false,
+        opaque: false,
+        background: false,
+        commands: [{
+          words: [],
+          resolvedArgv: ["printf", "ok"],
+          assignments: [],
+          redirects: [{ operator: ">", target: path, write: true }],
+        }],
+        writeTargets: [{ path, mode: "file", operation: "redirect >" }],
+        writeTargetsComplete: true,
+        warnings,
+      },
+      warnings,
+    }];
+    const evidence = buildReviewEvidence(
+      {
+        ...request,
+        toolName: "bash",
+        originalToolName: "bash",
+        input: { command: "printf ok > output.txt" },
+      },
+      {
+        ...policy,
+        ruleId: "complex-shell-command",
+        reason: "shell command requires review",
+      },
+      analyses,
+    );
     expect(evidence.safeForAutoReview).toBe(true);
   });
 

@@ -66,7 +66,7 @@ export const codexAutoReviewer: PermissionReviewer = {
           timeoutMs: TIMEOUT_MS,
           maxRetries: 0,
           reasoningEffort: "low",
-          reasoningSummary: "off",
+          reasoningSummary: "concise",
           textVerbosity: "low",
           toolChoice: "none",
         },
