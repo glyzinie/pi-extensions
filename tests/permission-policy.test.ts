@@ -203,6 +203,59 @@ describe("permission policy", () => {
     }
   });
 
+  test("allows configured static single-command prefixes without weakening hard guards", async () => {
+    const rules = parsePermissionRules(JSON.stringify({
+      version: 1,
+      rules: [{
+        tool: "bash",
+        commandPrefixes: [
+          ["bun", "test"],
+          ["bun", "run", "test"],
+          ["uv", "run", "pytest"],
+        ],
+        decision: "allow",
+      }],
+    }));
+
+    for (const command of ["bun test", "bun test src", "bun run test", "uv run pytest -q"]) {
+      const result = await evaluatePolicy(
+        request("bash", { command }),
+        await bashAnalysis(command),
+        rules,
+      );
+      expect(result).toMatchObject({ decision: "allow", ruleId: "configured-tool-rule" });
+    }
+
+    for (const command of [
+      "./bun test",
+      "PATH=/tmp bun test",
+      "bun test && true",
+      "bun test $FILTER",
+    ]) {
+      const result = await evaluatePolicy(
+        request("bash", { command }),
+        await bashAnalysis(command),
+        rules,
+      );
+      expect(result.decision).not.toBe("allow");
+    }
+
+    const deletion = "bun test; rm file.txt";
+    expect(await evaluatePolicy(
+      request("bash", { command: deletion }),
+      await bashAnalysis(deletion),
+      rules,
+    )).toMatchObject({ decision: "deny", ruleId: "bash-deletion-disallowed" });
+
+    const outside = `${homedir()}/permission-test-output-${process.pid}.txt`;
+    const redirect = `bun test > ${outside}`;
+    expect(await evaluatePolicy(
+      request("bash", { command: redirect }),
+      await bashAnalysis(redirect),
+      rules,
+    )).toMatchObject({ decision: "deny", ruleId: "bash-outside-sandbox-write-disallowed" });
+  });
+
   test("routes dynamic credential references to human review", async () => {
     const command = "cat \"$HOME/.ssh/id_ed25519\"";
     const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));

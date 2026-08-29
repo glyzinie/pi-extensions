@@ -24,6 +24,7 @@ import type {
   PermissionRequest,
 } from "./protocol.ts";
 import {
+  matchBashPermissionRule,
   matchPermissionRule,
   type PermissionRule,
 } from "./rules.ts";
@@ -361,6 +362,7 @@ async function evaluateWriteTool(request: PermissionRequest): Promise<Permission
 async function evaluateBash(
   request: PermissionRequest,
   analysis: BashTreeSitterAnalysis | undefined,
+  configuredRules: readonly PermissionRule[],
 ): Promise<PermissionPolicyResult> {
   const command = typeof request.input.command === "string" ? request.input.command.trim() : "";
   if (!command) return review("bash-command-missing", "bash command is missing or empty", "human");
@@ -429,6 +431,19 @@ async function evaluateBash(
     }
   }
 
+  const configuredArgv =
+    analysis.complete &&
+    !analysis.dynamic &&
+    !analysis.opaque &&
+    !analysis.background &&
+    analysis.commands.length === 1
+      ? analysis.commands[0]?.resolvedArgv
+      : undefined;
+  if (configuredArgv) {
+    const configured = configuredBashRulePolicy(configuredArgv, configuredRules);
+    if (configured) return configured;
+  }
+
   const safeStatic =
     analysis.complete &&
     !analysis.dynamic &&
@@ -479,6 +494,23 @@ async function evaluateBash(
   );
 }
 
+function configuredBashRulePolicy(
+  argv: readonly string[],
+  rules: readonly PermissionRule[],
+): PermissionPolicyResult | undefined {
+  const match = matchBashPermissionRule(argv, rules);
+  if (!match?.commandPrefix) return undefined;
+  const prefix = match.commandPrefix.join(" ");
+  const reason = `permission.json command prefix rule for bash: ${prefix}`;
+  const details = { commandPrefix: prefix };
+  switch (match.rule.decision) {
+    case "allow": return allow("configured-tool-rule", reason, details);
+    case "review": return review("configured-tool-rule", reason, "model-then-human", details);
+    case "human": return review("configured-tool-rule", reason, "human", details);
+    case "deny": return deny("configured-tool-rule", reason, details);
+  }
+}
+
 function configuredRulePolicy(
   request: PermissionRequest,
   rules: readonly PermissionRule[],
@@ -525,7 +557,9 @@ export async function evaluatePolicy(
   analyses: readonly PermissionAnalysis[],
   configuredRules: readonly PermissionRule[] = [],
 ): Promise<PermissionPolicyResult> {
-  if (request.toolName === "bash") return evaluateBash(request, bashAnalysis(analyses));
+  if (request.toolName === "bash") {
+    return evaluateBash(request, bashAnalysis(analyses), configuredRules);
+  }
   if (BUILTIN_READ_TOOLS.has(request.toolName)) return evaluateReadTool(request);
   if (BUILTIN_WRITE_TOOLS.has(request.toolName)) return evaluateWriteTool(request);
   const credentialPolicy = await genericCredentialPolicy(request);

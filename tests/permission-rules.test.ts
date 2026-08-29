@@ -4,6 +4,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import type { PermissionRequest } from "../extensions/permission/protocol.ts";
 import {
   loadPermissionRules,
+  matchBashPermissionRule,
   matchPermissionRule,
   parsePermissionConfig,
   parsePermissionRules,
@@ -16,6 +17,11 @@ const valid = JSON.stringify({
     { tool: "mem0_memory", actions: ["search", "get_all"], decision: "allow" },
     { tool: "mem0_memory", actions: ["add"], decision: "review" },
     { tool: "mem0_memory", actions: ["delete"], decision: "human" },
+    {
+      tool: "bash",
+      commandPrefixes: [["bun", "test"], ["uv", "run", "pytest"]],
+      decision: "allow",
+    },
     { tool: "legacy_tool", decision: "deny" },
   ],
 });
@@ -32,14 +38,17 @@ function request(toolName: string, action?: string): PermissionRequest {
 }
 
 describe("permission.json", () => {
-  test("parses and matches exact tool/action rules", () => {
+  test("parses and matches tool, action, and Bash prefix rules", () => {
     const config = parsePermissionConfig(valid);
     const rules = parsePermissionRules(valid);
     expect(config.language).toBe("ja");
-    expect(rules).toHaveLength(4);
+    expect(rules).toHaveLength(5);
     expect(matchPermissionRule(request("mem0_memory", "search"), rules)?.rule.decision).toBe("allow");
     expect(matchPermissionRule(request("mem0_memory", "unknown"), rules)).toBeUndefined();
     expect(matchPermissionRule(request("legacy_tool"), rules)?.rule.decision).toBe("deny");
+    expect(matchBashPermissionRule(["bun", "test", "src"], rules)?.commandPrefix).toEqual(["bun", "test"]);
+    expect(matchBashPermissionRule(["bun", "run", "test"], rules)).toBeUndefined();
+    expect(matchBashPermissionRule(["./bun", "test"], rules)).toBeUndefined();
   });
 
   test("rejects unknown versions, fields, decisions, and overlaps", () => {
@@ -55,6 +64,25 @@ describe("permission.json", () => {
       { version: 1, rules: [
         { tool: "x", actions: ["read"], decision: "allow" },
         { tool: "x", actions: ["read"], decision: "deny" },
+      ] },
+      { version: 1, rules: [
+        { tool: "bash", decision: "allow" },
+      ] },
+      { version: 1, rules: [
+        { tool: "bash", actions: ["test"], decision: "allow" },
+      ] },
+      { version: 1, rules: [
+        { tool: "other", commandPrefixes: [["bun", "test"]], decision: "allow" },
+      ] },
+      { version: 1, rules: [
+        {
+          tool: "bash",
+          commandPrefixes: [["bun", "test"], ["bun", "test", "unit"]],
+          decision: "allow",
+        },
+      ] },
+      { version: 1, rules: [
+        { tool: "bash", commandPrefixes: [["./bun", "test"]], decision: "allow" },
       ] },
     ]) {
       expect(() => parsePermissionRules(JSON.stringify(value))).toThrow();
