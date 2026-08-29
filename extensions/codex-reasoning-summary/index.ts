@@ -1,15 +1,53 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  SettingsManager,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
 type SummaryMode = "auto" | "concise" | "detailed";
+export type ReasoningDisplayLanguage = "en" | "ja";
 
 const TARGET_API = "openai-codex-responses";
 const SUMMARY_MODE: SummaryMode = "auto";
 const STATUS_KEY = "codex-reasoning-summary";
+const LANGUAGE_COMMAND = "codex-reasoning-summary-language";
+const SETTINGS_KEY = "codexReasoningSummary";
 const MAX_LABEL_LENGTH = 100;
 const MAX_SOURCE_LINE_LENGTH = 512;
+const JAPANESE_SUMMARY_INSTRUCTION =
+  "ユーザーに表示される reasoning summary を生成する場合、Markdown 見出しを含む要約本文は日本語で記述してください。コード識別子、ファイルパス、コマンド、引用文は原文のままにし、最終回答の言語はユーザーの指定に従ってください。";
+const JAPANESE_TEXT_PATTERN =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+const DEFAULT_JAPANESE_LABEL = "内容を検討中…";
+const ENGLISH_STATUS_LABELS: ReadonlyArray<{
+  pattern: RegExp;
+  label: string;
+}> = [
+  {
+    pattern: /\b(?:summar|finaliz|document|report|conclud|wrap|recap)\w*/i,
+    label: "結果を整理中…",
+  },
+  {
+    pattern:
+      /\b(?:test|verif|validat|lint|type[\s-]?check|build|built|compil|benchmark)\w*/i,
+    label: "動作を検証中…",
+  },
+  {
+    pattern:
+      /\b(?:implement|edit|updat|modif|refactor|fix|add|writ|creat|remov|patch|chang|apply|resolv)\w*/i,
+    label: "変更を実装中…",
+  },
+  {
+    pattern:
+      /\b(?:plan|design|consider|evaluat|decid|prepar|strateg|approach|weigh|choos|think|reason)\w*/i,
+    label: "方針を検討中…",
+  },
+  {
+    pattern:
+      /\b(?:analy|investigat|inspect|review|read|check|search|explor|look|trac|understand|examin|assess|debug|diagnos)\w*/i,
+    label: "情報を確認中…",
+  },
+];
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -29,6 +67,135 @@ function sanitizeLabel(value: string): string {
     .replace(/[\p{Cc}\p{Cf}]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isDisplayLanguage(value: unknown): value is ReasoningDisplayLanguage {
+  return value === "en" || value === "ja";
+}
+
+export function reasoningLanguageFromSettings(
+  settings: unknown,
+): ReasoningDisplayLanguage {
+  const root = asRecord(settings);
+  if (!root) {
+    throw new Error("Global settings must be a JSON object.");
+  }
+
+  const section = root[SETTINGS_KEY];
+  if (section === undefined) return "en";
+  const sectionRecord = asRecord(section);
+  if (!sectionRecord) {
+    throw new Error(`${SETTINGS_KEY} must be a JSON object.`);
+  }
+
+  const language = sectionRecord.language;
+  if (language === undefined) return "en";
+  if (!isDisplayLanguage(language)) {
+    throw new Error(`${SETTINGS_KEY}.language must be \"en\" or \"ja\".`);
+  }
+  return language;
+}
+
+export function updateReasoningLanguageSettings(
+  current: string | undefined,
+  language: ReasoningDisplayLanguage,
+): string {
+  const parsed: unknown = current
+    ? JSON.parse(current.replace(/^\uFEFF/, ""))
+    : {};
+  const root = asRecord(parsed);
+  if (!root) {
+    throw new Error("Global settings must be a JSON object.");
+  }
+
+  const existing = root[SETTINGS_KEY];
+  const existingRecord = existing === undefined ? {} : asRecord(existing);
+  if (!existingRecord) {
+    throw new Error(`${SETTINGS_KEY} must be a JSON object.`);
+  }
+  root[SETTINGS_KEY] = { ...existingRecord, language };
+  return JSON.stringify(root, null, 2);
+}
+
+type GlobalSettingsStorage = {
+  withLock(
+    scope: "global",
+    update: (current: string | undefined) => string | undefined,
+  ): void;
+};
+
+function settingsManager(
+  cwd: string,
+  projectTrusted: boolean,
+): SettingsManager {
+  return SettingsManager.create(cwd, undefined, { projectTrusted });
+}
+
+function throwGlobalSettingsLoadError(manager: SettingsManager): void {
+  const error = manager.drainErrors().find((item) => item.scope === "global");
+  if (error) throw error.error;
+}
+
+function loadConfiguredLanguage(
+  cwd: string,
+  projectTrusted: boolean,
+): ReasoningDisplayLanguage {
+  const manager = settingsManager(cwd, projectTrusted);
+  throwGlobalSettingsLoadError(manager);
+  return reasoningLanguageFromSettings(manager.getGlobalSettings());
+}
+
+function saveConfiguredLanguage(
+  cwd: string,
+  projectTrusted: boolean,
+  language: ReasoningDisplayLanguage,
+): void {
+  const manager = settingsManager(cwd, projectTrusted);
+  throwGlobalSettingsLoadError(manager);
+
+  // SettingsManager has no generic setter for extension-owned keys. Reuse its
+  // backing storage so this write follows Pi's settings-file lock protocol.
+  const storage = (
+    manager as unknown as { storage?: GlobalSettingsStorage }
+  ).storage;
+  if (!storage) throw new Error("Pi settings storage is unavailable.");
+  storage.withLock("global", (current) =>
+    updateReasoningLanguageSettings(current, language)
+  );
+}
+
+function parseLanguageArgument(value: string): ReasoningDisplayLanguage | undefined {
+  switch (value.trim().toLowerCase()) {
+    case "en":
+    case "english":
+      return "en";
+    case "ja":
+    case "jp":
+    case "japanese":
+    case "日本語":
+      return "ja";
+    default:
+      return undefined;
+  }
+}
+
+export function localizeReasoningLabel(label: string): string {
+  const sanitized = sanitizeLabel(label);
+  if (!sanitized) return DEFAULT_JAPANESE_LABEL;
+  if (JAPANESE_TEXT_PATTERN.test(sanitized)) return sanitized;
+
+  return ENGLISH_STATUS_LABELS.find(({ pattern }) => pattern.test(sanitized))
+    ?.label ?? DEFAULT_JAPANESE_LABEL;
+}
+
+export function formatReasoningStatus(
+  label: string,
+  language: ReasoningDisplayLanguage,
+): string {
+  const sanitized = sanitizeLabel(label);
+  return language === "ja"
+    ? `推論：${localizeReasoningLabel(sanitized)}`
+    : `Reasoning: ${sanitized}`;
 }
 
 interface CodeFence {
@@ -115,7 +282,8 @@ export default function codexReasoningSummary(pi: ExtensionAPI) {
   let discardLongLine = false;
   let codeFence: CodeFence | undefined;
   let contentIndex: number | undefined;
-  let activeLabel: string | undefined;
+  let displayLanguage: ReasoningDisplayLanguage = "en";
+  let activeStatus: string | undefined;
 
   const resetStreamState = () => {
     pendingLine = "";
@@ -125,15 +293,15 @@ export default function codexReasoningSummary(pi: ExtensionAPI) {
   };
 
   const clearStatus = (ctx: ExtensionContext) => {
-    if (activeLabel === undefined) return;
-    activeLabel = undefined;
+    activeStatus = undefined;
     ctx.ui.setStatus(STATUS_KEY, undefined);
   };
 
   const showLabel = (label: string, ctx: ExtensionContext) => {
-    if (label === activeLabel) return;
-    activeLabel = label;
-    ctx.ui.setStatus(STATUS_KEY, `Reasoning: ${label}`);
+    const status = formatReasoningStatus(label, displayLanguage);
+    if (status === activeStatus) return;
+    activeStatus = status;
+    ctx.ui.setStatus(STATUS_KEY, status);
   };
 
   const consumeThinkingDelta = (delta: string, ctx: ExtensionContext) => {
@@ -171,6 +339,75 @@ export default function codexReasoningSummary(pi: ExtensionAPI) {
       start = newline + 1;
     }
   };
+
+  pi.registerCommand(LANGUAGE_COMMAND, {
+    description: "Set the Codex reasoning summary language (en or ja)",
+    handler: async (args, ctx) => {
+      let language = parseLanguageArgument(args);
+
+      if (!args.trim()) {
+        const selected = await ctx.ui.select(
+          "Reasoning summary language",
+          ["English (default)", "日本語"],
+        );
+        if (selected === undefined) return;
+        language = selected === "日本語" ? "ja" : "en";
+      }
+
+      if (!language) {
+        ctx.ui.notify(`Usage: /${LANGUAGE_COMMAND} en|ja`, "warning");
+        return;
+      }
+
+      try {
+        saveConfiguredLanguage(ctx.cwd, ctx.isProjectTrusted(), language);
+      } catch (error) {
+        ctx.ui.notify(
+          `Could not save ~/.pi/agent/settings.json: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+        return;
+      }
+
+      displayLanguage = language;
+      clearStatus(ctx);
+      ctx.ui.notify(
+        language === "ja"
+          ? "推論要約の表示言語を日本語に変更しました。"
+          : "Reasoning summary language set to English.",
+        "info",
+      );
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    try {
+      displayLanguage = loadConfiguredLanguage(
+        ctx.cwd,
+        ctx.isProjectTrusted(),
+      );
+    } catch (error) {
+      displayLanguage = "en";
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Could not load codexReasoningSummary.language; using English: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    }
+    if (ctx.mode === "tui") clearStatus(ctx);
+    resetStreamState();
+  });
+
+  // The API has no summary locale parameter, so this is a best-effort request.
+  // The status formatter still guarantees a Japanese fallback for English headings.
+  pi.on("before_agent_start", (event, ctx) => {
+    if (displayLanguage !== "ja" || ctx.model?.api !== TARGET_API) return;
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${JAPANESE_SUMMARY_INSTRUCTION}`,
+    };
+  });
 
   // `auto` selects the most detailed summary mode supported by each model.
   pi.on("before_provider_request", (event, ctx) => {
