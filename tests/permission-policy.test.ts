@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 
 import { analyzeBashSource } from "../extensions/permission-tree-sitter-bash/index.ts";
 import {
@@ -140,6 +141,46 @@ describe("permission policy", () => {
     expect(external).toMatchObject({ decision: "review", route: "human", ruleId: "credential-external-tool" });
   });
 
+  test("keeps credential paths in attached command options human-only", async () => {
+    const credential = `${homedir()}/.ssh/config`;
+    const linkedCredential = `${root}/credential-option`;
+    symlinkSync(credential, linkedCredential);
+
+    for (const command of [
+      `file --files-from=${credential}`,
+      `file -f${linkedCredential}`,
+      `rg --ignore-file=${credential} pattern .`,
+    ]) {
+      const result = await evaluatePolicy(
+        request("bash", { command }),
+        await bashAnalysis(command),
+      );
+      expect(result).toMatchObject({
+        decision: "review",
+        route: "human",
+        ruleId: "credential-shell-access",
+      });
+    }
+  });
+
+  test("normalizes file URL paths before applying read policy", async () => {
+    const credentialUrl = pathToFileURL(`${homedir()}/.ssh`).href;
+    expect(await evaluatePolicy(
+      request("ls", { path: credentialUrl }),
+      [],
+    )).toMatchObject({
+      decision: "review",
+      route: "human",
+      ruleId: "credential-read",
+      details: { target: `${homedir()}/.ssh` },
+    });
+
+    expect(await evaluatePolicy(
+      request("ls", { path: pathToFileURL(cwd).href }),
+      [],
+    )).toMatchObject({ decision: "allow", ruleId: "builtin-read" });
+  });
+
   test("checks cwd when an optional built-in read path is omitted", async () => {
     const calls: Array<{ toolName: string; input: Record<string, unknown> }> = [
       { toolName: "grep", input: { pattern: "token" } },
@@ -246,7 +287,12 @@ describe("permission policy", () => {
   });
 
   test("does not auto-allow executable aliases or side-effecting options", async () => {
-    for (const command of ["./cat file", "tree -o output.txt", "rg --pre ./filter pattern"]) {
+    for (const command of [
+      "./cat file",
+      "tree -o output.txt",
+      "rg --pre ./filter pattern",
+      "file -C -m magic",
+    ]) {
       const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
       expect(result.decision).not.toBe("allow");
     }

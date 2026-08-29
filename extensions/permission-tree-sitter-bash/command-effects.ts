@@ -20,7 +20,6 @@ const SIMPLE_NO_WRITE_COMMANDS = new Set([
   "head",
   "tail",
   "wc",
-  "file",
   "stat",
   "echo",
   "printf",
@@ -85,6 +84,13 @@ function simpleOperands(
 
 function noWriteCommandIsComplete(name: string, argv: readonly string[]): boolean {
   if (SIMPLE_NO_WRITE_COMMANDS.has(name)) return true;
+  if (name === "file") {
+    return !argv.slice(1).some((arg) =>
+      arg === "--compile" ||
+      arg.startsWith("--compile=") ||
+      /^-[^-]*C/.test(arg),
+    );
+  }
   if (name === "tree") {
     return !argv.some((arg) => arg === "-o" || arg === "--output" || arg.startsWith("--output="));
   }

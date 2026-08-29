@@ -10,6 +10,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { BashStaticWord } from "../permission-tree-sitter-bash/types.ts";
 
@@ -83,6 +84,7 @@ function isMissingPathError(error: unknown): boolean {
 
 function expandToolPath(path: string, cwd: string): string {
   let value = path.startsWith("@") ? path.slice(1) : path;
+  if (value.startsWith("file://")) return resolve(fileURLToPath(value));
   if (value === "~") value = homedir();
   else if (value.startsWith("~/")) value = resolve(homedir(), value.slice(2));
   return isAbsolute(value) ? resolve(value) : resolve(cwd, value);

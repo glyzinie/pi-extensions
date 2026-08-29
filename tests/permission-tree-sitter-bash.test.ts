@@ -110,10 +110,12 @@ describe("permission-tree-sitter-bash", () => {
     const relative = await analyzeBashSource("./cat file");
     const treeOutput = await analyzeBashSource("tree -o output.txt");
     const treeLongOutput = await analyzeBashSource("tree --output=output.txt");
+    const fileCompile = await analyzeBashSource("file -C -m magic");
     const copy = await analyzeBashSource("cp source /outside/destination");
     expect(relative.writeTargetsComplete).toBe(false);
     expect(treeOutput.writeTargetsComplete).toBe(false);
     expect(treeLongOutput.writeTargetsComplete).toBe(false);
+    expect(fileCompile.writeTargetsComplete).toBe(false);
     expect(copy.writeTargetsComplete).toBe(false);
   });
 

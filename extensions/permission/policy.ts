@@ -5,6 +5,7 @@ import {
   BASH_ANALYSIS_KIND,
   TREE_SITTER_BASH_PLUGIN_ID,
   type BashCommand,
+  type BashStaticWord,
   type BashTreeSitterAnalysis,
 } from "../permission-tree-sitter-bash/types.ts";
 import {
@@ -148,17 +149,53 @@ function trustedCommandName(
 }
 
 const CREDENTIAL_MARKER = /(?:^|[\s'"=])(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.(?:ssh|aws|gnupg)(?:\/|[\s'"=]|$)|(?:^|[\s'"=])(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.(?:netrc|npmrc|pypirc|git-credentials)(?:[\s'"=]|$)|(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.docker\/config\.json|(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.config\/(?:gh\/hosts\.yml|gcloud\/application_default_credentials\.json)|(?:\.pi\/agent|\.codex)\/auth\.json/i;
+const ATTACHED_SHORT_PATH_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  file: ["-f", "-m"],
+  grep: ["-f"],
+  rg: ["-f"],
+};
+
+function pathWord(value: string, quoted: boolean): BashStaticWord {
+  return {
+    raw: value,
+    value,
+    quoted,
+    expandTilde: !quoted && (value === "~" || value.startsWith("~/")),
+  };
+}
+
+function credentialPathWords(command: BashCommand): BashStaticWord[] {
+  const arguments_ = command.words.slice(1);
+  const candidates = [
+    ...arguments_.filter((word) => !word.value?.startsWith("-")),
+    ...command.redirects.flatMap((redirect) => redirect.target ? [redirect.target] : []),
+  ];
+  const shortOptions = ATTACHED_SHORT_PATH_OPTIONS[basename(commandName(command))] ?? [];
+
+  for (const word of arguments_) {
+    const value = word.value;
+    if (!value?.startsWith("-")) continue;
+
+    const equals = value.indexOf("=");
+    if (equals >= 0 && equals + 1 < value.length) {
+      candidates.push(pathWord(value.slice(equals + 1), word.quoted));
+    }
+    for (const option of shortOptions) {
+      if (value.startsWith(option) && value.length > option.length) {
+        candidates.push(pathWord(value.slice(option.length), word.quoted));
+      }
+    }
+  }
+
+  return candidates;
+}
 
 async function credentialReference(
   analysis: BashTreeSitterAnalysis,
   paths: PathPolicyContext,
 ): Promise<PathIdentity | undefined> {
   for (const command of analysis.commands) {
-    const words = [
-      ...command.words.slice(1).filter((word) => !word.value?.startsWith("-")),
-      ...command.redirects.flatMap((redirect) => redirect.target ? [redirect.target] : []),
-    ];
-    for (const word of words) {
+    for (const word of credentialPathWords(command)) {
       if (!word.value) continue;
       try {
         const target = await resolveBashPathIdentity(word, paths.cwd);
