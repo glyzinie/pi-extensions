@@ -1,39 +1,29 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
 import {
-  fetchTextWithLimits,
-  RequestTimeoutError,
-  ResponseBodyTooLargeError,
-} from "../_shared/http.ts";
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  truncateHead,
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const SEARCH_URL = "https://grep.app/api/search";
 const REQUEST_TIMEOUT_MS = 30_000;
-const REQUEST_TIMEOUT_MESSAGE = `grep.app request timed out after ${REQUEST_TIMEOUT_MS}ms`;
-const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_LIMIT = 5;
 const MAX_SNIPPET_CHARS = 1_500;
-const MAX_OUTPUT_CHARS = 12_000;
 
 type RawField = string | { raw?: string } | null | undefined;
-
 type GrepAppHit = {
   repo?: RawField;
   path?: RawField;
   branch?: RawField;
   content?: { snippet?: string };
 };
-
 type GrepAppResponse = {
-  hits?: {
-    total?: number;
-    hits?: GrepAppHit[];
-  };
+  hits?: { total?: number; hits?: GrepAppHit[] };
 };
 
 function raw(value: RawField): string {
-  if (typeof value === "string") return value;
-  return value?.raw ?? "";
+  return typeof value === "string" ? value : value?.raw ?? "";
 }
 
 function decodeHtml(value: string): string {
@@ -47,11 +37,18 @@ function decodeHtml(value: string): string {
   };
 
   return value
-    .replace(/&#(\d+);/g, (_, n: string) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n: string) =>
-      String.fromCodePoint(Number.parseInt(n, 16)),
-    )
-    .replace(/&([a-z]+);/gi, (entity, name: string) => named[name] ?? entity);
+    .replace(/&#(\d+);/g, (entity, value: string) => {
+      const codePoint = Number(value);
+      return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (entity, value: string) => {
+      const codePoint = Number.parseInt(value, 16);
+      return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+    })
+    .replace(
+      /&([a-z]+);/gi,
+      (entity, name: string) => named[name.toLowerCase()] ?? entity,
+    );
 }
 
 function snippetToText(snippet: string): string {
@@ -67,102 +64,57 @@ function snippetToText(snippet: string): string {
     .trim();
 }
 
-async function fetchSearch(
-  url: URL,
-  signal?: AbortSignal,
-): Promise<GrepAppResponse> {
-  let lastError: unknown;
+function truncateOutput(text: string): { text: string; truncated: boolean } {
+  const suffix = "\n\n[Search output truncated.]";
+  const output = truncateHead(text, {
+    maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(suffix),
+    maxLines: DEFAULT_MAX_LINES - 2,
+  });
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const { response, bodyText } = await fetchTextWithLimits(
-        url.toString(),
-        {
-          headers: {
-            accept: "application/json",
-            "user-agent": "pi-grepapp/0.2",
-          },
-        },
-        {
-          timeoutMs: REQUEST_TIMEOUT_MS,
-          maxBytes: MAX_RESPONSE_BYTES,
-          timeoutMessage: REQUEST_TIMEOUT_MESSAGE,
-          signal,
-        },
-      );
-
-      if (!response.ok) {
-        const body = bodyText.slice(0, 500);
-        const error = new Error(
-          `grep.app HTTP ${response.status}${body ? `: ${body}` : ""}`,
-        );
-
-        if (attempt === 0 && (response.status === 429 || response.status >= 500)) {
-          lastError = error;
-          continue;
-        }
-
-        throw error;
-      }
-
-      try {
-        return JSON.parse(bodyText) as GrepAppResponse;
-      } catch {
-        throw new Error("grep.app returned an invalid JSON response");
-      }
-    } catch (error) {
-      const isBoundFailure =
-        error instanceof RequestTimeoutError ||
-        error instanceof ResponseBodyTooLargeError;
-      if (signal?.aborted || isBoundFailure || attempt === 1) throw error;
-      lastError = error;
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error("grep.app search failed");
+  return output.truncated
+    ? { text: output.content + suffix, truncated: true }
+    : { text, truncated: false };
 }
 
-function formatResults(response: GrepAppResponse, limit: number): string {
+function formatResults(response: GrepAppResponse, limit: number) {
   const hits = response.hits?.hits ?? [];
   const selected = hits.slice(0, limit);
   const total = response.hits?.total ?? hits.length;
 
-  if (selected.length === 0) return "No matches.";
+  if (selected.length === 0) {
+    return { text: "No matches.", total, shown: 0, truncated: false };
+  }
 
   const blocks = selected.map((hit, index) => {
     const repo = raw(hit.repo) || "?";
     const path = raw(hit.path) || "?";
     const branch = raw(hit.branch);
     const location = `${repo}:${path}${branch ? `@${branch}` : ""}`;
-    const snippet = snippetToText(hit.content?.snippet ?? "").slice(
-      0,
-      MAX_SNIPPET_CHARS,
-    );
+    const fullSnippet = snippetToText(hit.content?.snippet ?? "");
+    const snippet = fullSnippet.length > MAX_SNIPPET_CHARS
+      ? `${fullSnippet.slice(0, MAX_SNIPPET_CHARS)}…`
+      : fullSnippet;
 
-    return snippet ? `[${index + 1}] ${location}\n${snippet}` : `[${index + 1}] ${location}`;
+    return snippet
+      ? `[${index + 1}] ${location}\n${snippet}`
+      : `[${index + 1}] ${location}`;
   });
 
-  const output = [
-    `${total} match${total === 1 ? "" : "es"}; showing ${selected.length}.`,
-    "",
-    blocks.join("\n\n"),
-  ].join("\n");
-
-  if (output.length <= MAX_OUTPUT_CHARS) return output;
-
-  const truncated = output.slice(0, MAX_OUTPUT_CHARS).replace(/\n[^\n]*$/, "");
-  return `${truncated}\n[truncated]`;
+  const output = truncateOutput(
+    `${total} match${total === 1 ? "" : "es"}; showing ${selected.length}.\n\n${blocks.join("\n\n")}`,
+  );
+  return { ...output, total, shown: selected.length };
 }
 
 export default function grepAppExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "gh_code_search",
     label: "GitHub Code Search",
-    description: "Search public GitHub code via grep.app.",
+    description:
+      "Search public GitHub code via grep.app. Output is truncated to 50KB or 2000 lines.",
     promptSnippet: "Search public GitHub code",
-
     parameters: Type.Object({
-      query: Type.String(),
+      query: Type.String({ minLength: 1 }),
       repo: Type.Optional(Type.String()),
       path: Type.Optional(Type.String()),
       lang: Type.Optional(Type.Array(Type.String(), { maxItems: 4 })),
@@ -171,27 +123,44 @@ export default function grepAppExtension(pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal) {
-      const url = new URL(SEARCH_URL);
-      url.searchParams.set("q", params.query);
-      url.searchParams.set("page", "1");
+      const query = params.query.trim();
+      if (!query) throw new Error("Search query must not be empty.");
 
+      const url = new URL(SEARCH_URL);
+      url.searchParams.set("q", query);
+      url.searchParams.set("page", "1");
       if (params.repo) url.searchParams.set("f.repo.pattern", params.repo);
       if (params.path) url.searchParams.set("f.path.pattern", params.path);
-      for (const lang of params.lang ?? []) {
-        url.searchParams.append("f.lang", lang);
-      }
+      for (const lang of params.lang ?? []) url.searchParams.append("f.lang", lang);
       if (params.regex) url.searchParams.set("regexp", "true");
 
-      const response = await fetchSearch(url, signal);
-      const limit = params.limit ?? DEFAULT_LIMIT;
-      const text = formatResults(response, limit);
+      const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      const requestSignal = signal
+        ? AbortSignal.any([signal, timeout])
+        : timeout;
+      const response = await fetch(url, {
+        headers: {
+          accept: "application/json",
+          "user-agent": "pi-grepapp/0.2",
+        },
+        signal: requestSignal,
+      });
+      if (!response.ok) {
+        const body = (await response.text()).slice(0, 500).trim();
+        throw new Error(
+          `grep.app HTTP ${response.status}${body ? `: ${body}` : ""}`,
+        );
+      }
 
+      const payload = await response.json() as GrepAppResponse;
+      const output = formatResults(payload, params.limit ?? DEFAULT_LIMIT);
       return {
-        content: [{ type: "text", text }],
+        content: [{ type: "text" as const, text: output.text }],
         details: {
           provider: "grep.app",
-          total: response.hits?.total ?? response.hits?.hits?.length ?? 0,
-          shown: Math.min(response.hits?.hits?.length ?? 0, limit),
+          total: output.total,
+          shown: output.shown,
+          truncated: output.truncated,
         },
       };
     },
