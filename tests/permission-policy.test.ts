@@ -1,0 +1,226 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { homedir } from "node:os";
+import { mkdirSync, rmSync, symlinkSync } from "node:fs";
+
+import { analyzeBashSource } from "../extensions/permission-tree-sitter-bash/index.ts";
+import {
+  BASH_ANALYSIS_KIND,
+  TREE_SITTER_BASH_PLUGIN_ID,
+} from "../extensions/permission-tree-sitter-bash/types.ts";
+import { evaluatePolicy } from "../extensions/permission/policy.ts";
+import { parsePermissionRules } from "../extensions/permission/rules.ts";
+import type {
+  PermissionAnalysis,
+  PermissionRequest,
+} from "../extensions/permission/protocol.ts";
+
+const root = "/tmp/pi-permission-policy-test";
+const cwd = `${root}/workspace`;
+const protectedRoot = `${root}/pi-agent`;
+const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalCodexHome = process.env.CODEX_HOME;
+
+beforeEach(() => {
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(protectedRoot, { recursive: true });
+  process.env.PI_CODING_AGENT_DIR = protectedRoot;
+  process.env.CODEX_HOME = `${root}/codex`;
+});
+
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+  if (originalPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalPiAgentDir;
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = originalCodexHome;
+});
+
+function request(toolName: string, input: Record<string, unknown>, requestCwd = cwd): PermissionRequest {
+  return {
+    toolCallId: "call-1",
+    toolName,
+    originalToolName: toolName,
+    input,
+    cwd: requestCwd,
+    source: "pi",
+  };
+}
+
+async function bashAnalysis(command: string): Promise<PermissionAnalysis[]> {
+  const data = await analyzeBashSource(command);
+  return [{
+    analyzer: TREE_SITTER_BASH_PLUGIN_ID,
+    kind: BASH_ANALYSIS_KIND,
+    data,
+    warnings: data.warnings,
+  }];
+}
+
+describe("permission policy", () => {
+  test("allows a static trusted read command", async () => {
+    const command = "ls -la";
+    const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+    expect(result.decision).toBe("allow");
+    expect(result.ruleId).toBe("safe-static-shell");
+  });
+
+  test("requires human review when Bash analysis is unavailable", async () => {
+    const result = await evaluatePolicy(request("bash", { command: "ls" }), []);
+    expect(result).toMatchObject({
+      decision: "review",
+      route: "human",
+      ruleId: "bash-analyzer-unavailable",
+    });
+  });
+
+  test("keeps built-in writes reviewable but denies protected Bash writes", async () => {
+    const target = `${protectedRoot}/settings.json`;
+    const direct = await evaluatePolicy(
+      request("write", { path: target, content: "{}" }),
+      [],
+    );
+    const command = `touch ${target}`;
+    const bash = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+    expect(direct).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "protected-config-write",
+    });
+    expect(bash).toMatchObject({
+      decision: "deny",
+      ruleId: "bash-protected-write-disallowed",
+    });
+    expect(bash.reason).toContain("use write or edit");
+  });
+
+  test("keeps auth files, broad credential scans, and external paths human-only", async () => {
+    const direct = await evaluatePolicy(
+      request("write", { path: `${protectedRoot}/auth.json`, content: "{}" }),
+      [],
+    );
+    const command = "cat < ~/.ssh/id_ed25519";
+    const redirect = await evaluatePolicy(
+      request("bash", { command }),
+      await bashAnalysis(command),
+    );
+    const broad = await evaluatePolicy(
+      request("grep", { path: homedir(), pattern: "token" }, homedir()),
+      [],
+    );
+    const external = await evaluatePolicy(
+      request("mcp:read_file", { path: "~/.git-credentials" }),
+      [],
+    );
+    expect(direct).toMatchObject({ decision: "review", route: "human", ruleId: "credential-write" });
+    expect(redirect).toMatchObject({ decision: "review", route: "human", ruleId: "credential-shell-access" });
+    expect(broad).toMatchObject({ decision: "review", route: "human", ruleId: "credential-read" });
+    expect(external).toMatchObject({ decision: "review", route: "human", ruleId: "credential-external-tool" });
+  });
+
+  test("does not auto-allow temp symlinks whose canonical target is outside temp", async () => {
+    const link = `${root}/temp-link`;
+    symlinkSync(`${homedir()}/permission-symlink-target-${process.pid}`, link);
+    const result = await evaluatePolicy(
+      request("write", { path: link, content: "x" }),
+      [],
+    );
+    expect(result).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "outside-workspace-write",
+    });
+  });
+
+  test("does not auto-allow HOME as a workspace", async () => {
+    const result = await evaluatePolicy(
+      request("write", { path: `${homedir()}/ordinary-file`, content: "x" }, homedir()),
+      [],
+    );
+    expect(result).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "outside-workspace-write",
+    });
+  });
+
+  test("denies Bash writes outside the sandbox", async () => {
+    const target = `${homedir()}/permission-outside-${process.pid}.txt`;
+    const command = `touch ${target}`;
+    const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+    expect(result).toMatchObject({
+      decision: "deny",
+      ruleId: "bash-outside-sandbox-write-disallowed",
+    });
+    expect(result.reason).toContain("use write or edit");
+  });
+
+  test("denies Bash deletion and directs the model to trash", async () => {
+    for (const command of ["rm file.txt", "rmdir old-dir", "find . -delete", "git clean -fd"]) {
+      const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+      expect(result).toMatchObject({ decision: "deny", ruleId: "bash-deletion-disallowed" });
+      expect(result.reason).toContain("trash");
+    }
+  });
+
+  test("does not blanket-deny tests and builds with implicit workspace outputs", async () => {
+    for (const command of ["npm test", "npm run build", "cargo test"]) {
+      const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+      expect(result.decision).toBe("review");
+      expect(result.ruleId).toBe("complex-shell-command");
+    }
+  });
+
+  test("does not auto-allow executable aliases or side-effecting options", async () => {
+    for (const command of ["./cat file", "tree -o output.txt", "rg --pre ./filter pattern"]) {
+      const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+      expect(result.decision).not.toBe("allow");
+    }
+  });
+
+  test("routes dynamic credential references to human review", async () => {
+    const command = "cat \"$HOME/.ssh/id_ed25519\"";
+    const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+    expect(result).toMatchObject({
+      decision: "review",
+      route: "human",
+      ruleId: "credential-shell-access",
+    });
+  });
+
+  test("applies exact action rules from permission.json", async () => {
+    const rules = parsePermissionRules(JSON.stringify({
+      version: 1,
+      rules: [
+        { tool: "mem0_memory", actions: ["search", "get_all"], decision: "allow" },
+        { tool: "mem0_memory", actions: ["add"], decision: "review" },
+        { tool: "mem0_memory", actions: ["delete"], decision: "human" },
+      ],
+    }));
+    for (const action of ["search", "get_all"]) {
+      const result = await evaluatePolicy(request("mem0_memory", { action }), [], rules);
+      expect(result).toMatchObject({ decision: "allow", ruleId: "configured-tool-rule" });
+    }
+    expect(await evaluatePolicy(request("mem0_memory", { action: "add" }), [], rules)).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "configured-tool-rule",
+    });
+    expect(await evaluatePolicy(request("mem0_memory", { action: "delete" }), [], rules)).toMatchObject({
+      decision: "review",
+      route: "human",
+      ruleId: "configured-tool-rule",
+    });
+    expect(await evaluatePolicy(request("mem0_memory", { action: "unknown" }), [], rules)).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "custom-tool",
+    });
+  });
+
+  test("rejects stale analysis snapshots", async () => {
+    const analyses = await bashAnalysis("ls");
+    const result = await evaluatePolicy(request("bash", { command: "rm -rf /" }), analyses);
+    expect(result).toMatchObject({ decision: "review", route: "human", ruleId: "bash-analyzer-unavailable" });
+  });
+});

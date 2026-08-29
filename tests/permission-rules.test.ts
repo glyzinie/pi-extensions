@@ -1,0 +1,75 @@
+import { describe, expect, test } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+
+import type { PermissionRequest } from "../extensions/permission/protocol.ts";
+import {
+  loadPermissionRules,
+  matchPermissionRule,
+  parsePermissionConfig,
+  parsePermissionRules,
+} from "../extensions/permission/rules.ts";
+
+const valid = JSON.stringify({
+  version: 1,
+  language: "ja",
+  rules: [
+    { tool: "mem0_memory", actions: ["search", "get_all"], decision: "allow" },
+    { tool: "mem0_memory", actions: ["add"], decision: "review" },
+    { tool: "mem0_memory", actions: ["delete"], decision: "human" },
+    { tool: "legacy_tool", decision: "deny" },
+  ],
+});
+
+function request(toolName: string, action?: string): PermissionRequest {
+  return {
+    toolCallId: "call-1",
+    toolName,
+    originalToolName: toolName,
+    input: action ? { action } : {},
+    cwd: "/tmp",
+    source: "pi",
+  };
+}
+
+describe("permission.json", () => {
+  test("parses and matches exact tool/action rules", () => {
+    const config = parsePermissionConfig(valid);
+    const rules = parsePermissionRules(valid);
+    expect(config.language).toBe("ja");
+    expect(rules).toHaveLength(4);
+    expect(matchPermissionRule(request("mem0_memory", "search"), rules)?.rule.decision).toBe("allow");
+    expect(matchPermissionRule(request("mem0_memory", "unknown"), rules)).toBeUndefined();
+    expect(matchPermissionRule(request("legacy_tool"), rules)?.rule.decision).toBe("deny");
+  });
+
+  test("rejects unknown versions, fields, decisions, and overlaps", () => {
+    for (const value of [
+      { version: 2, rules: [] },
+      { version: 1, language: "fr", rules: [] },
+      { version: 1, extra: true, rules: [] },
+      { version: 1, rules: [{ tool: "x", decision: "maybe" }] },
+      { version: 1, rules: [
+        { tool: "x", decision: "allow" },
+        { tool: "x", actions: ["read"], decision: "deny" },
+      ] },
+      { version: 1, rules: [
+        { tool: "x", actions: ["read"], decision: "allow" },
+        { tool: "x", actions: ["read"], decision: "deny" },
+      ] },
+    ]) {
+      expect(() => parsePermissionRules(JSON.stringify(value))).toThrow();
+    }
+  });
+
+  test("loads missing files as no rules and invalid files fail closed", async () => {
+    const root = "/tmp/pi-permission-rules-test";
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(root, { recursive: true });
+    expect(await loadPermissionRules(`${root}/missing.json`)).toEqual({ language: "en", rules: [] });
+    writeFileSync(`${root}/permission.json`, "not-json");
+    const invalid = await loadPermissionRules(`${root}/permission.json`);
+    expect(invalid.rules).toEqual([]);
+    expect(invalid.error).toBeString();
+    rmSync(root, { recursive: true, force: true });
+  });
+});
