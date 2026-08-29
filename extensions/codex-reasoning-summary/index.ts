@@ -1,138 +1,246 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 
 type SummaryMode = "auto" | "concise" | "detailed";
 
-const SUMMARY_MODE: SummaryMode = "concise";
+const TARGET_API = "openai-codex-responses";
+const SUMMARY_MODE: SummaryMode = "auto";
+const STATUS_KEY = "codex-reasoning-summary";
 const MAX_LABEL_LENGTH = 100;
+const MAX_SOURCE_LINE_LENGTH = 512;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		return undefined;
-	}
-
-	return value as Record<string, unknown>;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
 }
 
-function extractLabel(text: string): string | undefined {
-	const cleaned = text
-		.replace(/<!--\s*-->/g, "")
-		.trim();
-
-	if (!cleaned) {
-		return undefined;
-	}
-
-	// Codex reasoning summaries often contain headings like:
-	// **Inspecting the repository**
-	const headings = [...cleaned.matchAll(/\*\*([^*\n]+)\*\*/g)];
-
-	let label = headings.at(-1)?.[1]?.trim();
-
-	if (!label) {
-		label = cleaned
-			.split("\n")
-			.map((line) =>
-				line
-					.replace(/^#+\s*/, "")
-					.replace(/^[-*]\s*/, "")
-					.trim(),
-			)
-			.find(Boolean);
-	}
-
-	if (!label) {
-		return undefined;
-	}
-
-	if (label.length > MAX_LABEL_LENGTH) {
-		return `${label.slice(0, MAX_LABEL_LENGTH - 1)}…`;
-	}
-
-	return label;
+function sanitizeLabel(value: string): string {
+  return value
+    // OSC, DCS/SOS/PM/APC, and CSI terminal control sequences.
+    .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, "")
+    .replace(/\u001B[P^_][\s\S]*?\u001B\\/g, "")
+    .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g, "")
+    // Drop remaining control and Unicode formatting characters, including
+    // incomplete escape sequences and bidi controls.
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-export default function (pi: ExtensionAPI) {
-	let thinking = "";
+interface CodeFence {
+  character: "`" | "~";
+  length: number;
+}
 
-	/*
-	 * Ask OpenAI Codex for a concise reasoning summary.
-	 *
-	 * Pi already requests "auto" by default. This simply makes
-	 * the desired behavior explicit and keeps the UI compact.
-	 */
-	pi.on("before_provider_request", (event, ctx) => {
-		if (ctx.model?.provider !== "openai-codex") {
-			return;
-		}
+function isIndentedCode(line: string): boolean {
+  let columns = 0;
+  for (const character of line) {
+    if (character === " ") columns += 1;
+    else if (character === "\t") columns += 4 - (columns % 4);
+    else break;
+    if (columns >= 4) return true;
+  }
+  return false;
+}
 
-		const payload = asRecord(event.payload);
-		if (!payload) {
-			return;
-		}
+function updateCodeFence(line: string, current: CodeFence | undefined): {
+  fence: CodeFence | undefined;
+  marker: boolean;
+} {
+  const match = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match) return { fence: current, marker: false };
 
-		const reasoning = asRecord(payload.reasoning);
-		if (!reasoning) {
-			return;
-		}
+  const sequence = match[1];
+  const character = sequence[0] as "`" | "~";
+  if (!current) {
+    return { fence: { character, length: sequence.length }, marker: true };
+  }
 
-		reasoning.summary = SUMMARY_MODE;
+  const closes =
+    character === current.character &&
+    sequence.length >= current.length &&
+    match[2].trim() === "";
+  return { fence: closes ? undefined : current, marker: true };
+}
 
-		return payload;
-	});
+function extractHeading(line: string): string | undefined {
+  if (isIndentedCode(line)) return undefined;
 
-	/*
-	 * New model turn -> reset the accumulated reasoning summary.
-	 */
-	pi.on("turn_start", (_event, ctx) => {
-		thinking = "";
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith("<!--")) return undefined;
 
-		if (ctx.hasUI) {
-			ctx.ui.setWorkingMessage();
-		}
-	});
+  // Only accept explicit, whole-line headings. Do not promote arbitrary bold
+  // phrases or reasoning details into the status indicator.
+  const bold = trimmed.match(/^\*\*([^*]+)\*\*$/)?.[1];
+  const markdown = trimmed.match(/^#{1,6}\s+(.+?)(?:\s+#+)?$/)?.[1];
+  const label = sanitizeLabel(bold ?? markdown ?? "");
+  if (!label) return undefined;
 
-	/*
-	 * Show the latest reasoning-summary heading in Pi's
-	 * working indicator.
-	 */
-	pi.on("message_update", (event, ctx) => {
-		if (!ctx.hasUI || ctx.model?.provider !== "openai-codex") {
-			return;
-		}
+  return label.length > MAX_LABEL_LENGTH
+    ? `${label.slice(0, MAX_LABEL_LENGTH - 1)}…`
+    : label;
+}
 
-		const update = event.assistantMessageEvent;
+function extractLatestHeading(text: string): string | undefined {
+  let latest: string | undefined;
+  let codeFence: CodeFence | undefined;
+  let start = 0;
 
-		if (update.type === "thinking_delta") {
-			thinking += update.delta;
+  while (start <= text.length) {
+    const newline = text.indexOf("\n", start);
+    const end = newline === -1 ? text.length : newline;
+    const lineLength = end - start;
+    const line = lineLength <= MAX_SOURCE_LINE_LENGTH
+      ? text.slice(start, end).replace(/\r$/, "")
+      : "";
+    const fenceUpdate = updateCodeFence(line, codeFence);
+    codeFence = fenceUpdate.fence;
+    if (!fenceUpdate.marker && !codeFence) {
+      latest = extractHeading(line) ?? latest;
+    }
 
-			const label = extractLabel(thinking);
+    if (newline === -1) break;
+    start = newline + 1;
+  }
 
-			if (label) {
-				ctx.ui.setWorkingMessage(label);
-			}
+  return latest;
+}
 
-			return;
-		}
+export default function codexReasoningSummary(pi: ExtensionAPI) {
+  let pendingLine = "";
+  let discardLongLine = false;
+  let codeFence: CodeFence | undefined;
+  let contentIndex: number | undefined;
+  let activeLabel: string | undefined;
 
-		// Final answer started.
-		if (update.type === "text_start") {
-			ctx.ui.setWorkingMessage();
-		}
-	});
+  const resetStreamState = () => {
+    pendingLine = "";
+    discardLongLine = false;
+    codeFence = undefined;
+    contentIndex = undefined;
+  };
 
-	pi.on("session_start", (_event, ctx) => {
-		if (!ctx.hasUI) {
-			return;
-		}
+  const clearStatus = (ctx: ExtensionContext) => {
+    if (activeLabel === undefined) return;
+    activeLabel = undefined;
+    ctx.ui.setStatus(STATUS_KEY, undefined);
+  };
 
-		ctx.ui.setHiddenThinkingLabel("Reasoning summary");
-	});
+  const showLabel = (label: string, ctx: ExtensionContext) => {
+    if (label === activeLabel) return;
+    activeLabel = label;
+    ctx.ui.setStatus(STATUS_KEY, `Reasoning: ${label}`);
+  };
 
-	pi.on("agent_end", (_event, ctx) => {
-		thinking = "";
+  const consumeThinkingDelta = (delta: string, ctx: ExtensionContext) => {
+    let start = 0;
 
-		if (ctx.hasUI) {
-			ctx.ui.setWorkingMessage();
-		}
-	});
+    while (start < delta.length) {
+      const newline = delta.indexOf("\n", start);
+      const end = newline === -1 ? delta.length : newline;
+      const completesLine = newline !== -1;
+      const hasTrailingCarriageReturn =
+        completesLine && end > start && delta[end - 1] === "\r";
+      const segmentEnd = hasTrailingCarriageReturn ? end - 1 : end;
+
+      if (!discardLongLine) {
+        const segmentLength = segmentEnd - start;
+        if (segmentLength > MAX_SOURCE_LINE_LENGTH - pendingLine.length) {
+          pendingLine = "";
+          discardLongLine = true;
+        } else {
+          pendingLine += delta.slice(start, segmentEnd);
+          if (completesLine) {
+            const fenceUpdate = updateCodeFence(pendingLine, codeFence);
+            codeFence = fenceUpdate.fence;
+            if (!fenceUpdate.marker && !codeFence) {
+              const label = extractHeading(pendingLine);
+              if (label) showLabel(label, ctx);
+            }
+          }
+        }
+      }
+
+      if (!completesLine) break;
+      pendingLine = "";
+      discardLongLine = false;
+      start = newline + 1;
+    }
+  };
+
+  // `auto` selects the most detailed summary mode supported by each model.
+  pi.on("before_provider_request", (event, ctx) => {
+    if (ctx.model?.api !== TARGET_API) return;
+
+    const payload = asRecord(event.payload);
+    const reasoning = asRecord(payload?.reasoning);
+    if (!payload || !reasoning || "summary" in reasoning) return;
+
+    reasoning.summary = SUMMARY_MODE;
+    return payload;
+  });
+
+  pi.on("turn_start", (_event, ctx) => {
+    if (ctx.mode === "tui") clearStatus(ctx);
+    resetStreamState();
+  });
+
+  pi.on("message_update", (event, ctx) => {
+    if (ctx.mode !== "tui") return;
+
+    if (
+      event.message.role !== "assistant" ||
+      event.message.api !== TARGET_API
+    ) {
+      clearStatus(ctx);
+      resetStreamState();
+      return;
+    }
+
+    const update = event.assistantMessageEvent;
+
+    if (update.type === "thinking_start") {
+      clearStatus(ctx);
+      resetStreamState();
+      contentIndex = update.contentIndex;
+      return;
+    }
+
+    if (update.type === "thinking_delta") {
+      if (contentIndex !== update.contentIndex) {
+        clearStatus(ctx);
+        resetStreamState();
+        contentIndex = update.contentIndex;
+      }
+      consumeThinkingDelta(update.delta, ctx);
+      return;
+    }
+
+    if (update.type === "thinking_end") {
+      if (contentIndex !== update.contentIndex) return;
+
+      const label = extractLatestHeading(update.content);
+      if (label) showLabel(label, ctx);
+      else clearStatus(ctx);
+      pendingLine = "";
+      discardLongLine = false;
+      codeFence = undefined;
+      contentIndex = undefined;
+      return;
+    }
+
+    if (update.type === "text_start") {
+      clearStatus(ctx);
+      resetStreamState();
+    }
+  });
+
+  pi.on("agent_end", (_event, ctx) => {
+    if (ctx.mode === "tui") clearStatus(ctx);
+    resetStreamState();
+  });
 }
