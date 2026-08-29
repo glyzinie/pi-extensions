@@ -36,7 +36,6 @@ const KNOWN_NON_MUTATING_TOOLS = new Set([
   "ask",
   "web_search",
   "web_fetch",
-  "gh_code_search",
 ]);
 const KNOWN_SELF_ENFORCING_TOOLS = new Set(["trash"]);
 const SAFE_BASH_COMMANDS = new Set([
