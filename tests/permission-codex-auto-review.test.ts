@@ -133,11 +133,13 @@ describe("Codex auto-review evidence", () => {
         dynamic: false,
         opaque: false,
         background: false,
+        controlOperators: [],
         commands: [{
           words: [],
           resolvedArgv: ["printf", "ok"],
           assignments: [],
           redirects: [{ operator: ">", target: path, write: true }],
+          effectsComplete: true,
         }],
         writeTargets: [{ path, mode: "file", operation: "redirect >" }],
         writeTargetsComplete: true,

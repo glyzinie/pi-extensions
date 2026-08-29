@@ -4,6 +4,7 @@ import { withParsedTree } from "./runtime.ts";
 import { inferCommandEffects } from "./command-effects.ts";
 import type {
   BashCommand,
+  BashControlOperator,
   BashRedirect,
   BashStaticWord,
   BashTreeSitterAnalysis,
@@ -14,6 +15,9 @@ const BASH_GRAMMAR = "tree-sitter-bash.wasm";
 const MAX_SOURCE_BYTES = 100_000;
 const MAX_TREE_NODES = 20_000;
 const WRITE_REDIRECTS = new Set([">", ">>", ">|", "&>", "&>>", ">&"]);
+const CONTROL_OPERATORS = new Set<BashControlOperator>([
+  "&&", "||", ";", "|", "|&", "&",
+]);
 const DYNAMIC_NODES = new Set([
   "command_substitution",
   "process_substitution",
@@ -165,6 +169,7 @@ function parseCommand(node: Node, source: string): BashCommand {
       : undefined,
     assignments,
     redirects: [],
+    effectsComplete: false,
   };
 }
 
@@ -191,6 +196,7 @@ function incomplete(source: string, warning: string): BashTreeSitterAnalysis {
     dynamic: true,
     opaque: true,
     background: false,
+    controlOperators: [],
     commands: [],
     writeTargets: [],
     writeTargetsComplete: false,
@@ -206,6 +212,10 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
   return withParsedTree(BASH_GRAMMAR, source, (tree) => {
     const warnings: string[] = [];
     const commandEntries: Array<{ node: Node; command: BashCommand }> = [];
+    const controlOperatorEntries: Array<{
+      startIndex: number;
+      operator: BashControlOperator;
+    }> = [];
     const redirectedStatements: Node[] = [];
     const stack = [tree.rootNode];
     let nodeCount = 0;
@@ -229,7 +239,11 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
           `${node.isMissing ? "missing" : "error"} ${node.type} at ${node.startPosition.row + 1}:${node.startPosition.column + 1}`,
         );
       }
-      if (!node.isNamed && node.type === "&") background = true;
+      if (!node.isNamed && CONTROL_OPERATORS.has(node.type as BashControlOperator)) {
+        const operator = node.type as BashControlOperator;
+        controlOperatorEntries.push({ startIndex: node.startIndex, operator });
+        if (operator === "&") background = true;
+      }
       if (DYNAMIC_NODES.has(node.type)) dynamic = true;
       else if (node.type === "variable_assignment") {
         dynamic = true;
@@ -284,9 +298,12 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
     let writeTargetsComplete = complete && !dynamic && !opaque;
     for (const { command } of commandEntries) {
       const effects = inferCommandEffects(command);
+      command.effectsComplete = effects.complete;
       writeTargets.push(...effects.writeTargets);
       writeTargetsComplete &&= effects.complete;
     }
+
+    controlOperatorEntries.sort((a, b) => a.startIndex - b.startIndex);
 
     return {
       raw: source,
@@ -294,6 +311,7 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
       dynamic,
       opaque,
       background,
+      controlOperators: controlOperatorEntries.map(({ operator }) => operator),
       commands: commandEntries.map(({ command }) => command),
       writeTargets,
       writeTargetsComplete,

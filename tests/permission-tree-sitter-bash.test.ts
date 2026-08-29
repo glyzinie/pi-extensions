@@ -8,14 +8,44 @@ describe("permission-tree-sitter-bash", () => {
     expect(result.complete).toBe(true);
     expect(result.dynamic).toBe(false);
     expect(result.opaque).toBe(false);
+    expect(result.controlOperators).toEqual([]);
     expect(result.commands[0]?.resolvedArgv).toEqual(["ls", "-la"]);
+    expect(result.commands[0]?.effectsComplete).toBe(true);
     expect(result.writeTargetsComplete).toBe(true);
   });
 
-  test("does not prove commands with environment assignments safe", async () => {
-    const result = await analyzeBashSource("PATH=/tmp ls");
-    expect(result.dynamic).toBe(true);
-    expect(result.writeTargetsComplete).toBe(false);
+  test("retains static control operators in source order", async () => {
+    const result = await analyzeBashSource("printf ok | grep ok && echo done; true");
+    expect(result).toMatchObject({
+      complete: true,
+      dynamic: false,
+      opaque: false,
+      background: false,
+      controlOperators: ["|", "&&", ";"],
+    });
+    expect(result.commands.map((command) => command.effectsComplete)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+
+    const pipeAll = await analyzeBashSource("printf ok |& grep ok || false");
+    expect(pipeAll.controlOperators).toEqual(["|&", "||"]);
+  });
+
+  test("does not prove expansions, assignments, or background execution safe", async () => {
+    const assignment = await analyzeBashSource("PATH=/tmp ls");
+    expect(assignment.dynamic).toBe(true);
+    expect(assignment.writeTargetsComplete).toBe(false);
+
+    const expansion = await analyzeBashSource("printf %s \"$VALUE\"");
+    expect(expansion.dynamic).toBe(true);
+    expect(expansion.writeTargetsComplete).toBe(false);
+
+    const background = await analyzeBashSource("printf ok &");
+    expect(background.background).toBe(true);
+    expect(background.controlOperators).toEqual(["&"]);
   });
 
   test("preserves Bash tilde quote semantics", async () => {

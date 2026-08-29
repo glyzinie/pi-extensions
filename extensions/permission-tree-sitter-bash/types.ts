@@ -1,4 +1,5 @@
 export type BashWriteTargetMode = "file" | "subtree";
+export type BashControlOperator = "&&" | "||" | ";" | "|" | "|&" | "&";
 
 export const BASH_ANALYSIS_KIND = "bash/tree-sitter" as const;
 export const TREE_SITTER_BASH_PLUGIN_ID = "tree-sitter-bash" as const;
@@ -24,6 +25,8 @@ export interface BashCommand {
   resolvedArgv?: readonly string[];
   assignments: readonly string[];
   redirects: readonly BashRedirect[];
+  /** Whether intrinsic command effects are fully modeled; redirects are tracked separately. */
+  effectsComplete: boolean;
 }
 
 export interface BashWriteTarget {
@@ -39,6 +42,8 @@ export interface BashTreeSitterAnalysis {
   dynamic: boolean;
   opaque: boolean;
   background: boolean;
+  /** Explicit control operators in source order. Newlines are implicit sequences. */
+  controlOperators: readonly BashControlOperator[];
   commands: readonly BashCommand[];
   writeTargets: readonly BashWriteTarget[];
   /** Every possible write destination is represented by writeTargets. */

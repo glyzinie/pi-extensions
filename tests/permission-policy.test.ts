@@ -58,11 +58,12 @@ async function bashAnalysis(command: string): Promise<PermissionAnalysis[]> {
 }
 
 describe("permission policy", () => {
-  test("allows a static trusted read command", async () => {
-    const command = "ls -la";
-    const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
-    expect(result.decision).toBe("allow");
-    expect(result.ruleId).toBe("safe-static-shell");
+  test("allows static trusted commands and compositions", async () => {
+    for (const command of ["ls -la", "printf ok | grep ok && echo done"]) {
+      const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
+      expect(result.decision).toBe("allow");
+      expect(result.ruleId).toBe("safe-static-shell");
+    }
   });
 
   test("requires human review when Bash analysis is unavailable", async () => {
@@ -203,7 +204,7 @@ describe("permission policy", () => {
     }
   });
 
-  test("allows configured static single-command prefixes without weakening hard guards", async () => {
+  test("allows configured prefixes across static shell compositions without weakening guards", async () => {
     const rules = parsePermissionRules(JSON.stringify({
       version: 1,
       rules: [{
@@ -217,7 +218,18 @@ describe("permission policy", () => {
       }],
     }));
 
-    for (const command of ["bun test", "bun test src", "bun run test", "uv run pytest -q"]) {
+    for (const command of [
+      "bun test",
+      "bun test src",
+      "bun run test",
+      "uv run pytest -q",
+      "bun test && true",
+      "bun test || false",
+      "bun test | head -n 1",
+      "bun test |& head -n 1",
+      "bun test; bun run test",
+      "bun test\ntrue",
+    ]) {
       const result = await evaluatePolicy(
         request("bash", { command }),
         await bashAnalysis(command),
@@ -227,17 +239,30 @@ describe("permission policy", () => {
     }
 
     for (const command of [
-      "./bun test",
       "PATH=/tmp bun test",
-      "bun test && true",
       "bun test $FILTER",
+      "bun test $(true)",
+      "bun test &",
     ]) {
       const result = await evaluatePolicy(
         request("bash", { command }),
         await bashAnalysis(command),
         rules,
       );
-      expect(result.decision).not.toBe("allow");
+      expect(result).toMatchObject({ decision: "review", ruleId: "complex-shell-command" });
+    }
+
+    for (const command of [
+      "./bun test",
+      "bun test && npm test",
+      "bun test | tree -o output.txt",
+    ]) {
+      const result = await evaluatePolicy(
+        request("bash", { command }),
+        await bashAnalysis(command),
+        rules,
+      );
+      expect(result).toMatchObject({ decision: "review", ruleId: "unrecognized-shell-command" });
     }
 
     const deletion = "bun test; rm file.txt";
@@ -254,6 +279,31 @@ describe("permission policy", () => {
       await bashAnalysis(redirect),
       rules,
     )).toMatchObject({ decision: "deny", ruleId: "bash-outside-sandbox-write-disallowed" });
+  });
+
+  test("uses the strongest configured decision across a static composition", async () => {
+    const rules = parsePermissionRules(JSON.stringify({
+      version: 1,
+      rules: [
+        { tool: "bash", commandPrefixes: [["bun", "test"]], decision: "allow" },
+        { tool: "bash", commandPrefixes: [["deploy"]], decision: "human" },
+        { tool: "bash", commandPrefixes: [["blocked"]], decision: "deny" },
+      ],
+    }));
+
+    const human = "bun test && deploy";
+    expect(await evaluatePolicy(
+      request("bash", { command: human }),
+      await bashAnalysis(human),
+      rules,
+    )).toMatchObject({ decision: "review", route: "human", ruleId: "configured-tool-rule" });
+
+    const denied = "deploy || blocked";
+    expect(await evaluatePolicy(
+      request("bash", { command: denied }),
+      await bashAnalysis(denied),
+      rules,
+    )).toMatchObject({ decision: "deny", ruleId: "configured-tool-rule" });
   });
 
   test("routes dynamic credential references to human review", async () => {

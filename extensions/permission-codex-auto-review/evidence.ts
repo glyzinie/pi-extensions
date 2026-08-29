@@ -74,7 +74,11 @@ function projectBashAnalysis(data: unknown): unknown {
     dynamic: analysis.dynamic,
     opaque: analysis.opaque,
     background: analysis.background,
-    commands: analysis.commands?.map((command) => ({ argv: command.resolvedArgv })),
+    controlOperators: analysis.controlOperators,
+    commands: analysis.commands?.map((command) => ({
+      argv: command.resolvedArgv,
+      effectsComplete: command.effectsComplete,
+    })),
     redirects: analysis.commands?.flatMap((command) => command.redirects),
     writeTargets: analysis.writeTargets,
     writeTargetsComplete: analysis.writeTargetsComplete,

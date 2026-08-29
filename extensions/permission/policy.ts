@@ -265,6 +265,15 @@ function isBashDeletion(command: BashCommand): boolean {
   );
 }
 
+function isDeterministicSafeBashCommand(command: BashCommand): boolean {
+  const name = trustedCommandName(command);
+  return (
+    command.effectsComplete === true &&
+    name !== undefined &&
+    SAFE_BASH_COMMANDS.has(name)
+  );
+}
+
 async function evaluateReadTool(request: PermissionRequest): Promise<PermissionPolicyResult> {
   // grep, find, and ls use cwd when path is omitted, so assess that effective target too.
   const rawPath = pathFromInput(request.input) ?? request.cwd;
@@ -431,34 +440,66 @@ async function evaluateBash(
     }
   }
 
-  const configuredArgv =
+  const staticallyComposable =
     analysis.complete &&
     !analysis.dynamic &&
     !analysis.opaque &&
     !analysis.background &&
-    analysis.commands.length === 1
-      ? analysis.commands[0]?.resolvedArgv
-      : undefined;
-  if (configuredArgv) {
-    const configured = configuredBashRulePolicy(configuredArgv, configuredRules);
-    if (configured) return configured;
-  }
+    analysis.commands.length > 0;
+  if (staticallyComposable) {
+    const configuredResults: PermissionPolicyResult[] = [];
+    let hasUnmatchedCommand = false;
 
-  const safeStatic =
-    analysis.complete &&
-    !analysis.dynamic &&
-    !analysis.opaque &&
-    !analysis.background &&
-    analysis.writeTargetsComplete &&
-    analysis.commands.length > 0 &&
-    analysis.commands.every((commandNode) => {
-      const name = trustedCommandName(commandNode);
-      return name !== undefined && SAFE_BASH_COMMANDS.has(name);
-    });
-  if (safeStatic) {
-    return allow("safe-static-shell", "all shell commands are static, local, and recognized as low risk", {
-      targets: writeAssessment.targets,
-    });
+    for (const commandNode of analysis.commands) {
+      const configured = commandNode.resolvedArgv
+        ? configuredBashRulePolicy(commandNode.resolvedArgv, configuredRules)
+        : undefined;
+      if (configured) {
+        configuredResults.push(configured);
+      } else if (!isDeterministicSafeBashCommand(commandNode)) {
+        hasUnmatchedCommand = true;
+      }
+    }
+
+    const configuredDeny = configuredResults.find((result) => result.decision === "deny");
+    if (configuredDeny) return configuredDeny;
+    const configuredHumanReview = configuredResults.find(
+      (result) => result.decision === "review" && result.route === "human",
+    );
+    if (configuredHumanReview) return configuredHumanReview;
+    const configuredModelReview = configuredResults.find(
+      (result) => result.decision === "review",
+    );
+    if (configuredModelReview) return configuredModelReview;
+
+    if (!hasUnmatchedCommand) {
+      if (analysis.commands.length === 1 && configuredResults.length === 1) {
+        return configuredResults[0]!;
+      }
+      const commandPrefixes = [...new Set(configuredResults.flatMap((result) => {
+        const prefix = result.details?.commandPrefix;
+        return result.decision === "allow" && typeof prefix === "string" ? [prefix] : [];
+      }))];
+      if (commandPrefixes.length > 0) {
+        return allow(
+          "configured-tool-rule",
+          "all commands in the static shell composition are allowed by configured or deterministic rules",
+          {
+            commandPrefixes,
+            controlOperators: analysis.controlOperators ?? [],
+            targets: writeAssessment.targets,
+          },
+        );
+      }
+      return allow(
+        "safe-static-shell",
+        "all shell commands are static, local, and recognized as low risk",
+        {
+          controlOperators: analysis.controlOperators ?? [],
+          targets: writeAssessment.targets,
+        },
+      );
+    }
   }
 
   if (
@@ -476,6 +517,7 @@ async function evaluateBash(
         dynamic: analysis.dynamic,
         opaque: analysis.opaque,
         background: analysis.background,
+        controlOperators: analysis.controlOperators ?? [],
         warnings: analysis.warnings,
       },
     );
@@ -488,6 +530,7 @@ async function evaluateBash(
       : "shell command effects are not completely modeled by the deterministic policy",
     "model-then-human",
     {
+      controlOperators: analysis.controlOperators ?? [],
       targets: writeAssessment.targets,
       writeTargetsComplete: analysis.writeTargetsComplete,
     },
