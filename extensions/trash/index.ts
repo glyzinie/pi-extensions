@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -8,7 +8,10 @@ const TRASH = "/usr/bin/trash";
 
 function isInside(path: string, root: string): boolean {
   const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return (
+    rel === "" ||
+    (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+  );
 }
 
 function validatePath(input: string, cwd: string, workspace: string): string {
@@ -79,6 +82,7 @@ export default function trashExtension(pi: ExtensionAPI) {
         description: "Workspace-relative or absolute paths to move to Trash. Globs are not expanded.",
       }),
     }),
+    executionMode: "sequential",
 
     async execute(_id, { paths }, signal, _onUpdate, ctx) {
       if (process.platform !== "darwin") {
