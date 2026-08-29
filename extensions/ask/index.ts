@@ -70,10 +70,19 @@ function uniqueOptions(values: string[]): string[] {
 }
 
 function otherLabel(options: string[]): string {
-  for (const label of ["✎ Other…", "✎ Type another answer…", "✎ Free text…"]) {
+  const preferred = [
+    "✎ Other…",
+    "✎ Type another answer…",
+    "✎ Free text…",
+    "✎ Custom answer…",
+  ];
+  for (const label of preferred) {
     if (!options.includes(label)) return label;
   }
-  return "✎ Custom answer…";
+
+  let suffix = 2;
+  while (options.includes(`✎ Custom answer ${suffix}…`)) suffix += 1;
+  return `✎ Custom answer ${suffix}…`;
 }
 
 function toolResultText(result: ToolResultLike): string {
