@@ -1,10 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { fetchTextWithLimits, truncateToolOutput } from "../http.ts";
+
 const JINA_READER_BASE = "https://r.jina.ai/";
 const DEFAULT_MAX_CHARS = 50_000;
 const MAX_MAX_CHARS = 200_000;
 const REQUEST_TIMEOUT_MS = 35_000;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_CHARS = 2_000;
 
 type FetchParams = {
@@ -51,34 +54,6 @@ function normalizeTargetUrl(rawUrl: string): URL | null {
   }
 }
 
-async function fetchTextWithTimeout(
-  input: string,
-  init: RequestInit,
-  timeoutMs: number,
-  outerSignal?: AbortSignal,
-): Promise<{ response: Response; bodyText: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error(`Jina Reader request timed out after ${timeoutMs}ms`)),
-    timeoutMs,
-  );
-
-  const abortFromOuter = () => controller.abort(outerSignal?.reason);
-  if (outerSignal) {
-    if (outerSignal.aborted) abortFromOuter();
-    else outerSignal.addEventListener("abort", abortFromOuter, { once: true });
-  }
-
-  try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
-    const bodyText = await response.text();
-    return { response, bodyText };
-  } finally {
-    clearTimeout(timer);
-    outerSignal?.removeEventListener("abort", abortFromOuter);
-  }
-}
-
 export default function piJina(pi: ExtensionAPI) {
   pi.registerTool({
     name: "web_fetch",
@@ -106,7 +81,7 @@ export default function piJina(pi: ExtensionAPI) {
     ) {
       const target = normalizeTargetUrl(params.url);
       if (!target) {
-        return textContent(
+        throw new Error(
           "web_fetch requires a valid public http:// or https:// URL without embedded credentials.",
         );
       }
@@ -129,20 +104,24 @@ export default function piJina(pi: ExtensionAPI) {
       let response: Response;
       let bodyText: string;
       try {
-        ({ response, bodyText } = await fetchTextWithTimeout(
+        ({ response, bodyText } = await fetchTextWithLimits(
           `${JINA_READER_BASE}${target.toString()}`,
           { method: "GET", headers },
-          REQUEST_TIMEOUT_MS,
-          signal,
+          {
+            timeoutMs: REQUEST_TIMEOUT_MS,
+            maxBytes: MAX_RESPONSE_BYTES,
+            timeoutMessage: `Jina Reader request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+            signal,
+          },
         ));
       } catch (error) {
         if (signal?.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
-        return textContent(`Jina Reader request failed: ${message}`);
+        throw new Error(`Jina Reader request failed: ${message}`);
       }
       if (!response.ok) {
         const body = bodyText.slice(0, MAX_ERROR_BODY_CHARS).trim();
-        return textContent(
+        throw new Error(
           `Jina Reader API error ${response.status} ${response.statusText}${body ? `\n${body}` : ""}`,
         );
       }
@@ -151,7 +130,7 @@ export default function piJina(pi: ExtensionAPI) {
       try {
         payload = JSON.parse(bodyText) as JinaPayload;
       } catch {
-        return textContent("Jina Reader returned an invalid JSON response.");
+        throw new Error("Jina Reader returned an invalid JSON response.");
       }
 
       const data = payload.data;
@@ -178,16 +157,19 @@ export default function piJina(pi: ExtensionAPI) {
         );
       }
 
+      const output = truncateToolOutput(lines.join("\n"));
+
       return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
+        content: [{ type: "text" as const, text: output.text }],
         details: {
           provider: "jina-reader",
           url: resolvedUrl,
           title,
           published,
-          truncated,
+          truncated: truncated || output.truncated,
           original_chars: content.length,
           returned_chars: returnedContent.length,
+          output_truncated: output.truncated,
         },
       };
     },

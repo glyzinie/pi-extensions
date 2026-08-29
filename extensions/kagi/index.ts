@@ -1,10 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { fetchTextWithLimits, truncateToolOutput } from "../http.ts";
+
 const KAGI_ENDPOINT = "https://kagi.com/api/v1/search";
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 20;
+const MAX_QUERY_CHARS = 2_000;
 const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_CHARS = 2_000;
 
 type SearchParams = {
@@ -74,34 +78,6 @@ function extractResults(payload: unknown): NormalizedResult[] {
   return results;
 }
 
-async function fetchTextWithTimeout(
-  input: string,
-  init: RequestInit,
-  timeoutMs: number,
-  outerSignal?: AbortSignal,
-): Promise<{ response: Response; bodyText: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error(`Kagi request timed out after ${timeoutMs}ms`)),
-    timeoutMs,
-  );
-
-  const abortFromOuter = () => controller.abort(outerSignal?.reason);
-  if (outerSignal) {
-    if (outerSignal.aborted) abortFromOuter();
-    else outerSignal.addEventListener("abort", abortFromOuter, { once: true });
-  }
-
-  try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
-    const bodyText = await response.text();
-    return { response, bodyText };
-  } finally {
-    clearTimeout(timer);
-    outerSignal?.removeEventListener("abort", abortFromOuter);
-  }
-}
-
 export default function piKagi(pi: ExtensionAPI) {
   pi.registerTool({
     name: "web_search",
@@ -112,6 +88,7 @@ export default function piKagi(pi: ExtensionAPI) {
       query: Type.String({
         description: "Search query.",
         minLength: 1,
+        maxLength: MAX_QUERY_CHARS,
       }),
       limit: Type.Optional(
         Type.Integer({
@@ -129,13 +106,16 @@ export default function piKagi(pi: ExtensionAPI) {
     ) {
       const apiKey = process.env.KAGI_API_KEY?.trim();
       if (!apiKey) {
-        return textContent(
+        throw new Error(
           "Kagi search is not configured: set KAGI_API_KEY in the environment before starting Pi.",
         );
       }
 
       const query = params.query?.trim();
-      if (!query) return textContent("Search query must not be empty.");
+      if (!query) throw new Error("Search query must not be empty.");
+      if (query.length > MAX_QUERY_CHARS) {
+        throw new Error(`Search query must not exceed ${MAX_QUERY_CHARS} characters.`);
+      }
 
       const limit = Math.max(
         1,
@@ -145,7 +125,7 @@ export default function piKagi(pi: ExtensionAPI) {
       let response: Response;
       let bodyText: string;
       try {
-        ({ response, bodyText } = await fetchTextWithTimeout(
+        ({ response, bodyText } = await fetchTextWithLimits(
           KAGI_ENDPOINT,
           {
             method: "POST",
@@ -160,17 +140,21 @@ export default function piKagi(pi: ExtensionAPI) {
               limit,
             }),
           },
-          REQUEST_TIMEOUT_MS,
-          signal,
+          {
+            timeoutMs: REQUEST_TIMEOUT_MS,
+            maxBytes: MAX_RESPONSE_BYTES,
+            timeoutMessage: `Kagi request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+            signal,
+          },
         ));
       } catch (error) {
         if (signal?.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
-        return textContent(`Kagi request failed: ${message}`);
+        throw new Error(`Kagi request failed: ${message}`);
       }
       if (!response.ok) {
         const body = bodyText.slice(0, MAX_ERROR_BODY_CHARS).trim();
-        return textContent(
+        throw new Error(
           `Kagi API error ${response.status} ${response.statusText}${body ? `\n${body}` : ""}`,
         );
       }
@@ -179,7 +163,7 @@ export default function piKagi(pi: ExtensionAPI) {
       try {
         payload = JSON.parse(bodyText);
       } catch {
-        return textContent("Kagi returned an invalid JSON response.");
+        throw new Error("Kagi returned an invalid JSON response.");
       }
 
       const results = extractResults(payload).slice(0, limit);
@@ -197,13 +181,16 @@ export default function piKagi(pi: ExtensionAPI) {
         lines.push("");
       }
 
+      const output = truncateToolOutput(lines.join("\n").trimEnd());
+
       return {
-        content: [{ type: "text" as const, text: lines.join("\n").trimEnd() }],
+        content: [{ type: "text" as const, text: output.text }],
         details: {
           provider: "kagi",
           query,
           count: results.length,
           results,
+          truncated: output.truncated,
         },
       };
     },
