@@ -1,1 +1,4 @@
 /.pi/
+/node_modules/
+/coverage/
+*.tsbuildinfo
