@@ -1,6 +1,7 @@
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   formatSize,
@@ -26,9 +27,19 @@ const parameters = Type.Object({
 
 function resolvePath(input: string | undefined, cwd: string): string {
   if (!input || input === ".") return cwd;
-  if (input === "~") return homedir();
-  if (input.startsWith("~/")) return resolve(homedir(), input.slice(2));
-  return isAbsolute(input) ? resolve(input) : resolve(cwd, input);
+
+  const normalized = input.startsWith("@") ? input.slice(1) : input;
+  if (!normalized || normalized === ".") return cwd;
+  if (normalized === "~") return homedir();
+  if (normalized.startsWith("~/")) {
+    return resolve(homedir(), normalized.slice(2));
+  }
+  if (normalized.startsWith("file://")) return fileURLToPath(normalized);
+  return isAbsolute(normalized) ? resolve(normalized) : resolve(cwd, normalized);
+}
+
+function displayEntryName(name: string): string {
+  return JSON.stringify(name).slice(1, -1);
 }
 
 function normalizeLimit(limit: number | undefined): {
@@ -76,8 +87,8 @@ export default function lsExtension(pi: ExtensionAPI): void {
       );
 
       const selected = entries.slice(0, normalized.value);
-      const lines = selected.map((entry) =>
-        entry.name + (entry.isDirectory() ? "/" : ""),
+      const lines = selected.map(
+        (entry) => displayEntryName(entry.name) + (entry.isDirectory() ? "/" : ""),
       );
 
       if (lines.length === 0) {
