@@ -33,6 +33,23 @@ export interface LoadedPermissionRules extends PermissionConfig {
   error?: string;
 }
 
+interface ToolRuleBucket {
+  all?: PermissionRule;
+  actions: Map<string, PermissionRule>;
+}
+
+interface BashRuleCandidate {
+  rule: PermissionRule;
+  prefix: PermissionCommandPrefix;
+}
+
+interface PermissionRuleIndex {
+  tools: Map<string, ToolRuleBucket>;
+  bashPrefixes: Map<string, BashRuleCandidate[]>;
+}
+
+const RULE_INDEXES = new WeakMap<readonly PermissionRule[], PermissionRuleIndex>();
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -54,6 +71,37 @@ function commandPrefixesOverlap(
   right: readonly string[],
 ): boolean {
   return isCommandPrefix(left, right) || isCommandPrefix(right, left);
+}
+
+function buildPermissionRuleIndex(
+  rules: readonly PermissionRule[],
+): PermissionRuleIndex {
+  const tools = new Map<string, ToolRuleBucket>();
+  const bashPrefixes = new Map<string, BashRuleCandidate[]>();
+
+  for (const rule of rules) {
+    if (rule.commandPrefixes) {
+      for (const prefix of rule.commandPrefixes) {
+        const executable = prefix[0]!;
+        const candidates = bashPrefixes.get(executable) ?? [];
+        candidates.push({ rule, prefix });
+        bashPrefixes.set(executable, candidates);
+      }
+      continue;
+    }
+
+    const bucket: ToolRuleBucket = tools.get(rule.tool) ?? {
+      actions: new Map<string, PermissionRule>(),
+    };
+    if (rule.actions) {
+      for (const action of rule.actions) bucket.actions.set(action, rule);
+    } else {
+      bucket.all = rule;
+    }
+    tools.set(rule.tool, bucket);
+  }
+
+  return { tools, bashPrefixes };
 }
 
 export function parsePermissionConfig(text: string): PermissionConfig {
@@ -191,7 +239,9 @@ export function parsePermissionConfig(text: string): PermissionConfig {
       decision: value.decision as PermissionRuleDecision,
     }));
   }
-  return { language, rules: Object.freeze(rules) };
+  const frozenRules = Object.freeze(rules);
+  RULE_INDEXES.set(frozenRules, buildPermissionRuleIndex(frozenRules));
+  return { language, rules: frozenRules };
 }
 
 export function parsePermissionRules(text: string): readonly PermissionRule[] {
@@ -225,6 +275,14 @@ export function matchPermissionRule(
   const action = typeof request.input.action === "string"
     ? request.input.action
     : undefined;
+  const index = RULE_INDEXES.get(rules);
+  if (index) {
+    const bucket = index.tools.get(request.toolName);
+    if (!bucket) return undefined;
+    const rule = bucket.all ?? (action === undefined ? undefined : bucket.actions.get(action));
+    return rule ? { rule, action } : undefined;
+  }
+
   for (const rule of rules) {
     if (rule.tool !== request.toolName || rule.commandPrefixes) continue;
     if (!rule.actions || (action !== undefined && rule.actions.includes(action))) {
@@ -239,6 +297,14 @@ export function matchBashPermissionRule(
   rules: readonly PermissionRule[],
 ): PermissionRuleMatch | undefined {
   if (argv.length === 0 || argv[0]?.includes("/")) return undefined;
+  const index = RULE_INDEXES.get(rules);
+  if (index) {
+    const candidates = index.bashPrefixes.get(argv[0]!);
+    if (!candidates) return undefined;
+    const match = candidates.find(({ prefix }) => isCommandPrefix(prefix, argv));
+    return match ? { rule: match.rule, commandPrefix: match.prefix } : undefined;
+  }
+
   for (const rule of rules) {
     if (rule.tool !== "bash" || !rule.commandPrefixes) continue;
     const commandPrefix = rule.commandPrefixes.find((prefix) =>

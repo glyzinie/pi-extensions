@@ -30,6 +30,13 @@ const SIMPLE_NO_WRITE_COMMANDS = new Set([
   "[",
   "cd",
 ]);
+const EMPTY_OPTIONS = new Set<string>();
+const FD_EXEC_OPTIONS = new Set(["-x", "--exec", "-X", "--exec-batch"]);
+const TOUCH_LONG_OPTIONS = new Set(["--no-create"]);
+const MKDIR_LONG_OPTIONS = new Set(["--parents", "--verbose"]);
+const RM_LONG_OPTIONS = new Set(["--force", "--interactive", "--recursive", "--verbose"]);
+const RMDIR_LONG_OPTIONS = new Set(["--parents", "--verbose"]);
+const TEE_LONG_OPTIONS = new Set(["--append", "--ignore-interrupts"]);
 
 function commandName(word: BashStaticWord | undefined): string | undefined {
   const value = word?.value;
@@ -49,11 +56,12 @@ function target(
 function simpleOperands(
   words: readonly BashStaticWord[],
   allowedShort: RegExp,
-  allowedLong: ReadonlySet<string> = new Set(),
+  allowedLong: ReadonlySet<string> = EMPTY_OPTIONS,
 ): BashStaticWord[] | undefined {
   const operands: BashStaticWord[] = [];
   let options = true;
-  for (const word of words.slice(1)) {
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index]!;
     const value = word.value;
     if (value === undefined) return undefined;
     if (options && value === "--") {
@@ -61,7 +69,8 @@ function simpleOperands(
       continue;
     }
     if (options && value.startsWith("--")) {
-      const name = value.split("=", 1)[0]!;
+      const equals = value.indexOf("=");
+      const name = equals < 0 ? value : value.slice(0, equals);
       if (!allowedLong.has(name)) return undefined;
       continue;
     }
@@ -84,7 +93,7 @@ function noWriteCommandIsComplete(name: string, argv: readonly string[]): boolea
   }
   if (name === "fd") {
     return !argv.some((arg) =>
-      ["-x", "--exec", "-X", "--exec-batch"].includes(arg) ||
+      FD_EXEC_OPTIONS.has(arg) ||
       arg.startsWith("--exec=") ||
       arg.startsWith("--exec-batch="),
     );
@@ -106,7 +115,7 @@ export function inferCommandEffects(command: BashCommand): CommandEffects {
     const operands = simpleOperands(
       command.words,
       /^-[acm]+$/,
-      new Set(["--no-create"]),
+      TOUCH_LONG_OPTIONS,
     );
     return operands
       ? { writeTargets: operands.map((word) => target(word, "file", "touch")), complete: true }
@@ -117,7 +126,7 @@ export function inferCommandEffects(command: BashCommand): CommandEffects {
     const operands = simpleOperands(
       command.words,
       /^-[pv]+$/,
-      new Set(["--parents", "--verbose"]),
+      MKDIR_LONG_OPTIONS,
     );
     if (!operands) return { writeTargets: [], complete: false };
     return {
@@ -130,11 +139,7 @@ export function inferCommandEffects(command: BashCommand): CommandEffects {
     const operands = simpleOperands(
       command.words,
       name === "rm" ? /^-[dfiIRrv]+$/ : /^-[pv]+$/,
-      new Set(
-        name === "rm"
-          ? ["--force", "--interactive", "--recursive", "--verbose"]
-          : ["--parents", "--verbose"],
-      ),
+      name === "rm" ? RM_LONG_OPTIONS : RMDIR_LONG_OPTIONS,
     );
     if (!operands) return { writeTargets: [], complete: false };
     const recursive = name === "rm" && argv.some((arg) =>
@@ -150,7 +155,7 @@ export function inferCommandEffects(command: BashCommand): CommandEffects {
     const operands = simpleOperands(
       command.words,
       /^-[ai]+$/,
-      new Set(["--append", "--ignore-interrupts"]),
+      TEE_LONG_OPTIONS,
     );
     return operands
       ? { writeTargets: operands.map((word) => target(word, "file", "tee")), complete: true }
@@ -158,7 +163,14 @@ export function inferCommandEffects(command: BashCommand): CommandEffects {
   }
 
   if (name === "dd") {
-    const output = command.words.slice(1).find((word) => word.value?.startsWith("of="));
+    let output: BashStaticWord | undefined;
+    for (let index = 1; index < command.words.length; index += 1) {
+      const word = command.words[index]!;
+      if (word.value?.startsWith("of=")) {
+        output = word;
+        break;
+      }
+    }
     if (!output?.value) return { writeTargets: [], complete: false };
     const value = output.value.slice(3);
     const rawPrefix = output.raw.indexOf("of=");

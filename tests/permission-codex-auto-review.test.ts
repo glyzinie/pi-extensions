@@ -5,6 +5,7 @@ import {
   parseReviewResponse,
   resolveCodexReviewModel,
 } from "../extensions/permission-codex-auto-review/index.ts";
+import { buildReviewPrompt } from "../extensions/permission-codex-auto-review/contract.ts";
 import { codexAutoReviewer } from "../extensions/permission-codex-auto-review/reviewer.ts";
 import type {
   PermissionAnalysis,
@@ -114,6 +115,41 @@ describe("Codex auto-review evidence", () => {
   test("projects bounded benign evidence", () => {
     const evidence = buildReviewEvidence(request, policy, []);
     expect(evidence.safeForAutoReview).toBe(true);
+    expect(evidence.serialized).toBe(JSON.stringify(evidence.value));
+  });
+
+  test("reuses compact evidence JSON in the review prompt", () => {
+    const evidence = buildReviewEvidence(request, policy, []);
+    expect(evidence.serialized).toBeDefined();
+
+    const prompt = buildReviewPrompt(evidence.serialized!);
+    expect(prompt).toContain(`>>> EVIDENCE START\n${evidence.serialized}\n>>> EVIDENCE END`);
+    expect(prompt).not.toContain(JSON.stringify(evidence.value, null, 2));
+  });
+
+  test("fails closed when the cumulative projection budget is exhausted", async () => {
+    const items = Array.from({ length: 40 }, (_, itemIndex) =>
+      Object.fromEntries(
+        Array.from({ length: 80 }, (_, keyIndex) => [
+          `key-${keyIndex}`,
+          `value-${itemIndex}-${keyIndex}`,
+        ]),
+      ),
+    );
+    const broadRequest = { ...request, input: { items } };
+    const evidence = buildReviewEvidence(broadRequest, policy, []);
+
+    expect(evidence.safeForAutoReview).toBe(false);
+    expect(evidence.serialized).toBeUndefined();
+    expect(JSON.stringify(evidence.value)).toContain("[omitted]");
+
+    const result = await codexAutoReviewer.review(
+      broadRequest,
+      policy,
+      [],
+      {} as any,
+    );
+    expect(result.decision).toBe("require-human");
   });
 
   test("keeps benign shared Bash analysis values eligible for auto-review", () => {
@@ -179,6 +215,7 @@ describe("Codex auto-review evidence", () => {
         analyses,
       );
       expect(evidence.safeForAutoReview).toBe(false);
+      expect(evidence.serialized).toBeUndefined();
       const serialized = JSON.stringify(evidence.value);
       expect(serialized).not.toContain("PRIVATE KEY");
       expect(serialized).not.toContain("sk-abcdefghijklmnop");

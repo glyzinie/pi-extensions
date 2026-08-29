@@ -51,6 +51,19 @@ describe("permission.json", () => {
     expect(matchBashPermissionRule(["./bun", "test"], rules)).toBeUndefined();
   });
 
+  test("keeps linear fallback behavior for external rule arrays", () => {
+    const indexed = parsePermissionRules(valid);
+    const external = [...indexed];
+    for (const rules of [indexed, external]) {
+      expect(matchPermissionRule(request("mem0_memory", "get_all"), rules)?.rule.decision).toBe("allow");
+      expect(matchPermissionRule(request("mem0_memory", "unknown"), rules)).toBeUndefined();
+      expect(matchPermissionRule(request("legacy_tool"), rules)?.rule.decision).toBe("deny");
+      expect(matchBashPermissionRule(["uv", "run", "pytest", "-q"], rules)?.commandPrefix)
+        .toEqual(["uv", "run", "pytest"]);
+      expect(matchBashPermissionRule(["./uv", "run", "pytest"], rules)).toBeUndefined();
+    }
+  });
+
   test("rejects unknown versions, fields, decisions, and overlaps", () => {
     for (const value of [
       { version: 2, rules: [] },

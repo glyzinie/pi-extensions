@@ -81,23 +81,23 @@ function immutableInput(value: Record<string, unknown>): Readonly<Record<string,
 function normalizeRequest(event: ToolCallEvent, ctx: ExtensionContext): PermissionRequest {
   const originalInput = isRecord(event.input) ? immutableInput(event.input) : {};
   if (event.toolName === "mcp" && typeof originalInput.tool === "string") {
-    return {
+    return Object.freeze({
       toolCallId: event.toolCallId,
       toolName: `mcp:${originalInput.tool}`,
       originalToolName: event.toolName,
       input: isRecord(originalInput.args) ? originalInput.args : originalInput,
       cwd: ctx.cwd,
-      source: "mcp",
-    };
+      source: "mcp" as const,
+    });
   }
-  return {
+  return Object.freeze({
     toolCallId: event.toolCallId,
     toolName: event.toolName,
     originalToolName: event.toolName,
     input: originalInput,
     cwd: ctx.cwd,
-    source: "pi",
-  };
+    source: "pi" as const,
+  });
 }
 
 function summarize(value: unknown, maxLength: number): string {
@@ -199,7 +199,7 @@ export default function permissionExtension(pi: ExtensionAPI): void {
       if (!analyzer.supports(request)) continue;
       try {
         const output = await analyzer.analyze(request, ctx);
-        if (output) analyses.push({ analyzer: analyzer.id, ...output });
+        if (output) analyses.push({ ...output, analyzer: analyzer.id });
       } catch (error) {
         analyses.push({
           analyzer: analyzer.id,
@@ -228,7 +228,7 @@ export default function permissionExtension(pi: ExtensionAPI): void {
       for (const reviewer of byPriority(reviewers.values())) {
         try {
           const result = await reviewer.review(request, policy, analyses, ctx);
-          reviews.push({ reviewer: reviewer.id, ...result });
+          reviews.push({ ...result, reviewer: reviewer.id });
           if (result.decision === "allow") return undefined;
           if (result.decision === "require-human") break;
         } catch (error) {
@@ -245,7 +245,7 @@ export default function permissionExtension(pi: ExtensionAPI): void {
     return {
       block: true,
       reason: ctx.hasUI
-        ? "Blocked by user"
+        ? permissionLabels(language).blockedByUser
         : `Permission required but no interactive UI is available: ${policy.reason}`,
     };
   });

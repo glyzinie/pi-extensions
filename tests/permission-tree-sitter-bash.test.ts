@@ -1,8 +1,30 @@
 import { describe, expect, test } from "bun:test";
 
-import { analyzeBashSource } from "../extensions/permission-tree-sitter-bash/index.ts";
+import permissionTreeSitterBash, {
+  analyzeBashSource,
+} from "../extensions/permission-tree-sitter-bash/index.ts";
 
 describe("permission-tree-sitter-bash", () => {
+  test("fails closed on non-string Bash input", async () => {
+    let analyzer: any;
+    permissionTreeSitterBash({
+      events: {
+        on() {},
+        emit(_name: string, event: { analyzer?: unknown }) {
+          if (event.analyzer) analyzer = event.analyzer;
+        },
+      },
+    } as any);
+
+    const result = await analyzer.analyze({ input: { command: 42 } });
+    expect(result.data).toMatchObject({
+      complete: false,
+      dynamic: true,
+      opaque: true,
+      writeTargetsComplete: false,
+    });
+  });
+
   test("parses a static read-only command", async () => {
     const result = await analyzeBashSource("ls -la");
     expect(result.complete).toBe(true);
@@ -71,6 +93,17 @@ describe("permission-tree-sitter-bash", () => {
       write: false,
       target: { value: "~/.ssh/id_ed25519", expandTilde: true },
     });
+  });
+
+  test("associates redirects with their commands in static compositions", async () => {
+    const result = await analyzeBashSource(
+      "printf one > first.txt; cat < ~/.ssh/config; printf two >> second.txt",
+    );
+    expect(result.commands.map((command) => command.redirects)).toMatchObject([
+      [{ operator: ">", target: { value: "first.txt" }, write: true }],
+      [{ operator: "<", target: { value: "~/.ssh/config" }, write: false }],
+      [{ operator: ">>", target: { value: "second.txt" }, write: true }],
+    ]);
   });
 
   test("does not trust relative executable aliases or complex utilities", async () => {

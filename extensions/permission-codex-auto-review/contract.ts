@@ -70,11 +70,11 @@ export function parseReviewResponse(text: string): ReviewPayload {
   };
 }
 
-export function buildReviewPrompt(evidence: unknown): string {
+export function buildReviewPrompt(serializedEvidence: string): string {
   return [
     "Assess this exact permission request. Evidence starts below.",
     ">>> EVIDENCE START",
-    JSON.stringify(evidence, null, 2),
+    serializedEvidence,
     ">>> EVIDENCE END",
   ].join("\n");
 }

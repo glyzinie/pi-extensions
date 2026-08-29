@@ -32,7 +32,7 @@ export const codexAutoReviewer: PermissionReviewer = {
     if (!evidence.safeForAutoReview) {
       return {
         decision: "require-human",
-        reason: "Review evidence contained a secret, cycle, or truncation and was not sent to Codex.",
+        reason: "Review evidence contained a secret, cycle, unsupported value, or size truncation and was not sent to Codex.",
       };
     }
 
@@ -57,7 +57,7 @@ export const codexAutoReviewer: PermissionReviewer = {
           systemPrompt: REVIEW_SYSTEM_PROMPT,
           messages: [{
             role: "user",
-            content: buildReviewPrompt(evidence.value),
+            content: buildReviewPrompt(evidence.serialized),
             timestamp: Date.now(),
           }],
         },

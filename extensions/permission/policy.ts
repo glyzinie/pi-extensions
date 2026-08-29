@@ -1,5 +1,4 @@
 import { accessSync, constants } from "node:fs";
-import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, resolve } from "node:path";
 
 import {
@@ -9,6 +8,7 @@ import {
   type BashTreeSitterAnalysis,
 } from "../permission-tree-sitter-bash/types.ts";
 import {
+  createPathPolicyContext,
   isInside,
   isCredentialPath,
   isDefaultSandboxWritable,
@@ -17,6 +17,7 @@ import {
   resolveBashPathIdentity,
   resolveToolPathIdentity,
   type PathIdentity,
+  type PathPolicyContext,
 } from "./paths.ts";
 import type {
   PermissionAnalysis,
@@ -110,35 +111,48 @@ function commandName(command: BashCommand): string {
   return command.resolvedArgv?.[0] ?? "";
 }
 
-function trustedCommandName(command: BashCommand): string | undefined {
+function trustedCommandName(
+  command: BashCommand,
+  cache: Map<string, string | undefined>,
+): string | undefined {
   const executable = commandName(command);
   if (!executable) return undefined;
-  if (SHELL_BUILTINS.has(executable)) return executable;
-  let path: string | undefined;
-  if (executable.includes("/")) {
-    if (!isAbsolute(executable)) return undefined;
-    path = resolve(executable);
+  if (cache.has(executable)) return cache.get(executable);
+
+  let trusted: string | undefined;
+  if (SHELL_BUILTINS.has(executable)) {
+    trusted = executable;
   } else {
-    for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-      if (!entry) continue;
-      const candidate = resolve(entry, executable);
-      try {
-        accessSync(candidate, constants.X_OK);
-        path = candidate;
-        break;
-      } catch {
-        // Continue PATH lookup.
+    let path: string | undefined;
+    if (executable.includes("/")) {
+      if (isAbsolute(executable)) path = resolve(executable);
+    } else {
+      for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+        if (!entry) continue;
+        const candidate = resolve(entry, executable);
+        try {
+          accessSync(candidate, constants.X_OK);
+          path = candidate;
+          break;
+        } catch {
+          // Continue PATH lookup.
+        }
       }
     }
+    trusted = path && TRUSTED_EXECUTABLE_DIRS.includes(dirname(path))
+      ? basename(path)
+      : undefined;
   }
-  return path && TRUSTED_EXECUTABLE_DIRS.includes(dirname(path)) ? basename(path) : undefined;
+
+  cache.set(executable, trusted);
+  return trusted;
 }
 
 const CREDENTIAL_MARKER = /(?:^|[\s'"=])(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.(?:ssh|aws|gnupg)(?:\/|[\s'"=]|$)|(?:^|[\s'"=])(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.(?:netrc|npmrc|pypirc|git-credentials)(?:[\s'"=]|$)|(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.docker\/config\.json|(?:~\/|\$HOME\/|\$\{HOME\}\/)?\.config\/(?:gh\/hosts\.yml|gcloud\/application_default_credentials\.json)|(?:\.pi\/agent|\.codex)\/auth\.json/i;
 
 async function credentialReference(
   analysis: BashTreeSitterAnalysis,
-  cwd: string,
+  paths: PathPolicyContext,
 ): Promise<PathIdentity | undefined> {
   for (const command of analysis.commands) {
     const words = [
@@ -148,8 +162,8 @@ async function credentialReference(
     for (const word of words) {
       if (!word.value) continue;
       try {
-        const target = await resolveBashPathIdentity(word, cwd);
-        if (isCredentialPath(target)) return target;
+        const target = await resolveBashPathIdentity(word, paths.cwd);
+        if (isCredentialPath(target, paths)) return target;
       } catch {
         if (CREDENTIAL_MARKER.test(word.raw)) {
           return { logical: word.raw, canonical: word.raw };
@@ -162,19 +176,23 @@ async function credentialReference(
     : undefined;
 }
 
-async function rootDeletion(command: BashCommand, cwd: string): Promise<boolean> {
-  if (trustedCommandName(command) !== "rm") return false;
+async function rootDeletion(
+  command: BashCommand,
+  paths: PathPolicyContext,
+  trustedCommands: Map<string, string | undefined>,
+): Promise<boolean> {
+  if (trustedCommandName(command, trustedCommands) !== "rm") return false;
   const argv = command.resolvedArgv;
   if (!argv) return false;
   const recursive = argv.slice(1).some((arg) => arg === "--recursive" || /^-[^-]*[rR]/.test(arg));
   const forced = argv.slice(1).some((arg) => arg === "--force" || /^-[^-]*f/.test(arg));
   if (!recursive || !forced) return false;
 
-  const home = await resolveToolPathIdentity(homedir(), cwd);
+  const home = await paths.homeIdentity();
   for (const word of command.words.slice(1)) {
     if (!word.value || word.value.startsWith("-")) continue;
     try {
-      const target = await resolveBashPathIdentity(word, cwd);
+      const target = await resolveBashPathIdentity(word, paths.cwd);
       if (target.canonical === resolve("/") || target.canonical === home.canonical) return true;
     } catch {
       // Dynamic targets are handled by the normal review path.
@@ -185,13 +203,14 @@ async function rootDeletion(command: BashCommand, cwd: string): Promise<boolean>
 
 async function hardDeniedCommand(
   commands: readonly BashCommand[],
-  cwd: string,
+  paths: PathPolicyContext,
+  trustedCommands: Map<string, string | undefined>,
 ): Promise<string | undefined> {
   for (const command of commands) {
     const argv = command.resolvedArgv;
     if (!argv) continue;
-    const name = trustedCommandName(command) ?? "";
-    if (await rootDeletion(command, cwd)) {
+    const name = trustedCommandName(command, trustedCommands) ?? "";
+    if (await rootDeletion(command, paths, trustedCommands)) {
       return "recursive forced deletion of the filesystem or home root";
     }
     if (/^(?:mkfs(?:\.[a-z0-9]+)?|newfs(?:_[a-z0-9]+)?)$/i.test(name)) {
@@ -214,29 +233,26 @@ async function hardDeniedCommand(
 
 async function assessBashWriteTargets(
   analysis: BashTreeSitterAnalysis,
-  cwd: string,
+  paths: PathPolicyContext,
 ): Promise<{
   targets: Array<Record<string, unknown>>;
   outsideSandbox: boolean;
   protected: boolean;
   credential: boolean;
-  deletion: boolean;
 }> {
   const targets: Array<Record<string, unknown>> = [];
   let outsideSandbox = false;
   let protectedPath = false;
   let credential = false;
-  let deletion = false;
 
   for (const target of analysis.writeTargets) {
-    const identity = await resolveBashPathIdentity(target.path, cwd);
-    const protectedRoot = protectedRootForPath(identity);
-    const credentialPath = isCredentialPath(identity);
-    const defaultWritable = await isDefaultSandboxWritable(identity, cwd);
+    const identity = await resolveBashPathIdentity(target.path, paths.cwd);
+    const protectedRoot = protectedRootForPath(identity, paths);
+    const credentialPath = isCredentialPath(identity, paths);
+    const defaultWritable = await isDefaultSandboxWritable(identity, paths);
     outsideSandbox ||= !defaultWritable;
     protectedPath ||= protectedRoot !== undefined;
     credential ||= credentialPath;
-    deletion ||= target.operation === "delete";
     targets.push({
       raw: target.path.raw,
       path: identity.logical,
@@ -249,11 +265,14 @@ async function assessBashWriteTargets(
     });
   }
 
-  return { targets, outsideSandbox, protected: protectedPath, credential, deletion };
+  return { targets, outsideSandbox, protected: protectedPath, credential };
 }
 
-function isBashDeletion(command: BashCommand): boolean {
-  const name = trustedCommandName(command);
+function isBashDeletion(
+  command: BashCommand,
+  trustedCommands: Map<string, string | undefined>,
+): boolean {
+  const name = trustedCommandName(command, trustedCommands);
   const argv = command.resolvedArgv ?? [];
   return (
     name === "rm" ||
@@ -265,8 +284,11 @@ function isBashDeletion(command: BashCommand): boolean {
   );
 }
 
-function isDeterministicSafeBashCommand(command: BashCommand): boolean {
-  const name = trustedCommandName(command);
+function isDeterministicSafeBashCommand(
+  command: BashCommand,
+  trustedCommands: Map<string, string | undefined>,
+): boolean {
+  const name = trustedCommandName(command, trustedCommands);
   return (
     command.effectsComplete === true &&
     name !== undefined &&
@@ -277,6 +299,7 @@ function isDeterministicSafeBashCommand(command: BashCommand): boolean {
 async function evaluateReadTool(request: PermissionRequest): Promise<PermissionPolicyResult> {
   // grep, find, and ls use cwd when path is omitted, so assess that effective target too.
   const rawPath = pathFromInput(request.input) ?? request.cwd;
+  const paths = createPathPolicyContext(request.cwd);
 
   let target: PathIdentity;
   try {
@@ -289,7 +312,7 @@ async function evaluateReadTool(request: PermissionRequest): Promise<PermissionP
       { error: error instanceof Error ? error.message : String(error) },
     );
   }
-  if (isCredentialPath(target)) {
+  if (isCredentialPath(target, paths)) {
     return review(
       "credential-read",
       `credential path access requires explicit approval: ${rawPath}`,
@@ -308,6 +331,7 @@ async function evaluateWriteTool(request: PermissionRequest): Promise<Permission
   if (!rawPath) {
     return review("write-path-missing", `${request.toolName} has no usable target path`, "human");
   }
+  const paths = createPathPolicyContext(request.cwd);
 
   let target: PathIdentity;
   try {
@@ -321,7 +345,7 @@ async function evaluateWriteTool(request: PermissionRequest): Promise<Permission
     );
   }
 
-  if (isCredentialPath(target)) {
+  if (isCredentialPath(target, paths)) {
     return review(
       "credential-write",
       `credential modification requires explicit approval: ${rawPath}`,
@@ -329,7 +353,7 @@ async function evaluateWriteTool(request: PermissionRequest): Promise<Permission
       { target: target.logical, canonicalTarget: target.canonical },
     );
   }
-  const protectedRoot = protectedRootForPath(target);
+  const protectedRoot = protectedRootForPath(target, paths);
   if (protectedRoot) {
     return review(
       "protected-config-write",
@@ -342,15 +366,15 @@ async function evaluateWriteTool(request: PermissionRequest): Promise<Permission
       },
     );
   }
-  if (isTempPath(target)) {
+  if (isTempPath(target, paths)) {
     return allow("temporary-write", `${request.toolName} writes to a temporary directory`, {
       target: target.logical,
       canonicalTarget: target.canonical,
     });
   }
 
-  const workspace = await resolveToolPathIdentity(request.cwd, request.cwd);
-  const home = await resolveToolPathIdentity(homedir(), request.cwd);
+  const workspace = await paths.workspaceIdentity();
+  const home = await paths.homeIdentity();
   if (
     workspace.canonical !== home.canonical &&
     isInside(workspace.canonical, target.canonical)
@@ -379,17 +403,25 @@ async function evaluateBash(
     return review("bash-analyzer-unavailable", "Bash analyzer is unavailable or stale", "human");
   }
 
-  const hardDeny = await hardDeniedCommand(analysis.commands, request.cwd);
+  const paths = createPathPolicyContext(request.cwd);
+  const trustedCommands = new Map<string, string | undefined>();
+  const hardDeny = await hardDeniedCommand(
+    analysis.commands,
+    paths,
+    trustedCommands,
+  );
   if (hardDeny) return deny("dangerous-shell-operation", `blocked dangerous shell operation: ${hardDeny}`);
 
-  if (analysis.commands.some(isBashDeletion)) {
+  if (analysis.commands.some((commandNode) =>
+    isBashDeletion(commandNode, trustedCommands)
+  )) {
     return deny(
       "bash-deletion-disallowed",
       "Bash deletion is disabled; use the trash tool so the operation remains recoverable",
     );
   }
 
-  const credential = await credentialReference(analysis, request.cwd);
+  const credential = await credentialReference(analysis, paths);
   if (credential) {
     return review(
       "credential-shell-access",
@@ -401,7 +433,7 @@ async function evaluateBash(
 
   let writeAssessment;
   try {
-    writeAssessment = await assessBashWriteTargets(analysis, request.cwd);
+    writeAssessment = await assessBashWriteTargets(analysis, paths);
   } catch (error) {
     return review(
       "bash-write-target-unresolved",
@@ -431,7 +463,9 @@ async function evaluateBash(
   }
 
   for (const commandNode of analysis.commands) {
-    if (PRIVILEGED_COMMANDS.has(trustedCommandName(commandNode) ?? "")) {
+    if (PRIVILEGED_COMMANDS.has(
+      trustedCommandName(commandNode, trustedCommands) ?? "",
+    )) {
       return review(
         "privileged-shell-command",
         `privileged shell command requires explicit approval: ${commandName(commandNode)}`,
@@ -456,7 +490,7 @@ async function evaluateBash(
         : undefined;
       if (configured) {
         configuredResults.push(configured);
-      } else if (!isDeterministicSafeBashCommand(commandNode)) {
+      } else if (!isDeterministicSafeBashCommand(commandNode, trustedCommands)) {
         hasUnmatchedCommand = true;
       }
     }
@@ -575,9 +609,10 @@ async function genericCredentialPolicy(
 ): Promise<PermissionPolicyResult | undefined> {
   const rawPath = pathFromInput(request.input);
   if (!rawPath) return undefined;
+  const paths = createPathPolicyContext(request.cwd);
   try {
     const path = await resolveToolPathIdentity(rawPath, request.cwd);
-    return isCredentialPath(path)
+    return isCredentialPath(path, paths)
       ? review(
           "credential-external-tool",
           `external tool references credential material: ${rawPath}`,

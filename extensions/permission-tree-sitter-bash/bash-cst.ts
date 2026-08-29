@@ -1,6 +1,6 @@
 import type { Node } from "web-tree-sitter";
 
-import { withParsedTree } from "./runtime.ts";
+import { withParsedBashTree } from "./runtime.ts";
 import { inferCommandEffects } from "./command-effects.ts";
 import type {
   BashCommand,
@@ -11,10 +11,10 @@ import type {
   BashWriteTarget,
 } from "./types.ts";
 
-const BASH_GRAMMAR = "tree-sitter-bash.wasm";
 const MAX_SOURCE_BYTES = 100_000;
 const MAX_TREE_NODES = 20_000;
 const WRITE_REDIRECTS = new Set([">", ">>", ">|", "&>", "&>>", ">&"]);
+const REDIRECT_OPERATOR = /^(?:<|>|>>|>\||&>|&>>|<&|>&)$/;
 const CONTROL_OPERATORS = new Set<BashControlOperator>([
   "&&", "||", ";", "|", "|&", "&",
 ]);
@@ -66,12 +66,29 @@ const OPAQUE_NODES = new Set([
   "heredoc_end",
 ]);
 
-function children(node: Node): Node[] {
-  return node.children.filter((child): child is Node => child !== null);
+interface CommandEntry {
+  node: Node;
+  command: BashCommand;
 }
 
-function namedChildren(node: Node): Node[] {
-  return node.namedChildren.filter((child): child is Node => child !== null);
+function findRedirectOwner(
+  entries: readonly CommandEntry[],
+  body: Node,
+): BashCommand | undefined {
+  let low = 0;
+  let high = entries.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (entries[middle]!.node.startIndex < body.startIndex) low = middle + 1;
+    else high = middle;
+  }
+
+  for (let index = low; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    if (entry.node.startIndex > body.endIndex) break;
+    if (entry.node.endIndex <= body.endIndex) return entry.command;
+  }
+  return undefined;
 }
 
 function sourceText(node: Node, source: string): string {
@@ -96,14 +113,24 @@ function decodeStaticWord(node: Node, source: string): BashStaticWord {
   }
 
   if (node.type === "string") {
-    const onlyText = namedChildren(node).every((child) => child.type === "string_content");
+    let onlyText = true;
+    for (let index = 0; index < node.namedChildCount; index += 1) {
+      if (node.namedChild(index)?.type !== "string_content") {
+        onlyText = false;
+        break;
+      }
+    }
     const inner = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : undefined;
     const value = onlyText && inner !== undefined && !inner.includes("\\") ? inner : undefined;
     return { raw, value, quoted: true, expandTilde: false };
   }
 
   if (node.type === "concatenation") {
-    const parts = namedChildren(node).map((part) => decodeStaticWord(part, source));
+    const parts: BashStaticWord[] = [];
+    for (let index = 0; index < node.namedChildCount; index += 1) {
+      const part = node.namedChild(index);
+      if (part) parts.push(decodeStaticWord(part, source));
+    }
     const value = parts.every((part) => part.value !== undefined)
       ? parts.map((part) => part.value!).join("")
       : undefined;
@@ -118,7 +145,7 @@ function decodeStaticWord(node: Node, source: string): BashStaticWord {
   if (node.type !== "word" && node.type !== "number") {
     return { raw, quoted: false, expandTilde: false };
   }
-  if (namedChildren(node).length > 0 || /[${}*?\[\]`\\]/.test(raw)) {
+  if (node.namedChildCount > 0 || /[${}*?\[\]`\\]/.test(raw)) {
     return { raw, quoted: false, expandTilde: false };
   }
   return {
@@ -131,9 +158,14 @@ function decodeStaticWord(node: Node, source: string): BashStaticWord {
 
 function parseRedirect(node: Node, source: string): BashRedirect | undefined {
   if (node.type !== "file_redirect") return undefined;
-  const operator = children(node).find(
-    (child) => !child.isNamed && /^(?:<|>|>>|>\||&>|&>>|<&|>&)$/.test(child.type),
-  )?.type;
+  let operator: string | undefined;
+  for (let index = 0; index < node.childCount; index += 1) {
+    const child = node.child(index);
+    if (child && !child.isNamed && REDIRECT_OPERATOR.test(child.type)) {
+      operator = child.type;
+      break;
+    }
+  }
   if (!operator) return undefined;
 
   const descriptor = node.childForFieldName("descriptor");
@@ -185,7 +217,9 @@ function mutatesShellState(command: BashCommand): boolean {
   return (
     command.assignments.length > 0 ||
     SHELL_STATE_COMMANDS.has(argv[0]!) ||
-    (argv[0] === "printf" && argv.slice(1).some((arg) => arg === "-v" || arg.startsWith("-v")))
+    (argv[0] === "printf" && argv.some(
+      (arg, index) => index > 0 && (arg === "-v" || arg.startsWith("-v")),
+    ))
   );
 }
 
@@ -209,9 +243,9 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
     return incomplete(source, `bash source exceeds ${MAX_SOURCE_BYTES} bytes`);
   }
 
-  return withParsedTree(BASH_GRAMMAR, source, (tree) => {
+  return withParsedBashTree(source, (tree) => {
     const warnings: string[] = [];
-    const commandEntries: Array<{ node: Node; command: BashCommand }> = [];
+    const commandEntries: CommandEntry[] = [];
     const controlOperatorEntries: Array<{
       startIndex: number;
       operator: BashControlOperator;
@@ -255,23 +289,20 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
       if (node.type === "command") {
         const command = parseCommand(node, source);
         dynamic ||= command.assignments.length > 0 || command.resolvedArgv === undefined;
+        if (mutatesShellState(command)) opaque = true;
         commandEntries.push({ node, command });
       }
-      for (const child of children(node)) stack.push(child);
+      for (let index = 0; index < node.childCount; index += 1) {
+        const child = node.child(index);
+        if (child) stack.push(child);
+      }
     }
 
     commandEntries.sort((a, b) => a.node.startIndex - b.node.startIndex);
-    if (commandEntries.some(({ command }) => mutatesShellState(command))) {
-      opaque = true;
-    }
     const redirectWriteTargets: BashWriteTarget[] = [];
     for (const node of redirectedStatements) {
       const body = node.childForFieldName("body");
-      const owner = body
-        ? commandEntries.find(({ node: commandNode }) =>
-            commandNode.startIndex >= body.startIndex && commandNode.endIndex <= body.endIndex,
-          )?.command
-        : undefined;
+      const owner = body ? findRedirectOwner(commandEntries, body) : undefined;
       for (let index = 0; index < node.namedChildCount; index += 1) {
         if (node.fieldNameForNamedChild(index) !== "redirect") continue;
         const redirectNode = node.namedChild(index);
@@ -318,8 +349,4 @@ export async function analyzeBashSource(source: string): Promise<BashTreeSitterA
       warnings: [...new Set(warnings)],
     };
   });
-}
-
-export function invalidBashAnalysis(source: string, warning: string): BashTreeSitterAnalysis {
-  return incomplete(source, warning);
 }

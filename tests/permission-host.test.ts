@@ -4,6 +4,10 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import permissionExtension from "../extensions/permission/index.ts";
 import permissionTreeSitterBash from "../extensions/permission-tree-sitter-bash/index.ts";
 import {
+  BASH_ANALYSIS_KIND,
+  TREE_SITTER_BASH_PLUGIN_ID,
+} from "../extensions/permission-tree-sitter-bash/types.ts";
+import {
   PERMISSION_EVENTS,
   PERMISSION_PROTOCOL_VERSION,
 } from "../extensions/permission/protocol.ts";
@@ -126,6 +130,53 @@ describe("Permission host", () => {
     expect(legacyGrants).toEqual([]);
   });
 
+  test("keeps request snapshots and analyzer identities host-owned", async () => {
+    const testHarness = harness();
+    permissionExtension(testHarness.pi);
+    let frozen = false;
+    testHarness.pi.events.emit(PERMISSION_EVENTS.registerAnalyzer, {
+      protocolVersion: PERMISSION_PROTOCOL_VERSION,
+      analyzer: {
+        id: "spoofing-analyzer",
+        supports(request: any) {
+          frozen = Object.isFrozen(request) && Object.isFrozen(request.input);
+          try {
+            request.toolName = "write";
+            request.input.command = "touch outside";
+          } catch {
+            // Frozen snapshots reject analyzer mutations.
+          }
+          return true;
+        },
+        analyze: async () => ({
+          analyzer: TREE_SITTER_BASH_PLUGIN_ID,
+          kind: BASH_ANALYSIS_KIND,
+          data: {
+            raw: "ls",
+            complete: true,
+            dynamic: false,
+            opaque: false,
+            background: false,
+            controlOperators: [],
+            commands: [],
+            writeTargets: [],
+            writeTargetsComplete: true,
+            warnings: [],
+          },
+        } as any),
+      },
+    });
+
+    const result = await testHarness.emit(
+      "tool_call",
+      { type: "tool_call", toolCallId: "bash-spoof", toolName: "bash", input: { command: "ls" } },
+      context("/tmp"),
+    );
+    expect(frozen).toBe(true);
+    expect(result).toMatchObject({ block: true });
+    expect((result as { reason: string }).reason).toContain("Bash analyzer is unavailable or stale");
+  });
+
   test("preserves human fallback for built-in write and edit", async () => {
     const root = "/tmp/pi-permission-human-write-test";
     const protectedRoot = `${root}/pi-agent`;
@@ -183,7 +234,10 @@ describe("Permission host", () => {
       japaneseContext,
     );
     expect(read).toBeUndefined();
-    expect(remove).toMatchObject({ block: true });
+    expect(remove).toMatchObject({
+      block: true,
+      reason: "ユーザーが拒否しました",
+    });
     expect(prompt).toContain("権限の確認: mem0_memory");
     expect(prompt).toContain("理由:");
     expect(options).toEqual(["今回のみ許可", "拒否"]);

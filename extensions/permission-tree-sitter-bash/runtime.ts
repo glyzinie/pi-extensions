@@ -6,40 +6,32 @@ import {
   type Tree,
 } from "web-tree-sitter";
 
+const BASH_GRAMMAR = "tree-sitter-bash.wasm";
 const require = createRequire(import.meta.url);
-let runtimePromise: Promise<void> | undefined;
-const languagePromises = new Map<string, Promise<Language>>();
+let languagePromise: Promise<Language> | undefined;
 
-function initializeRuntime(): Promise<void> {
-  runtimePromise ??= Parser.init();
-  return runtimePromise;
+function loadBashLanguage(): Promise<Language> {
+  languagePromise ??= (async () => {
+    await Parser.init();
+    return Language.load(
+      require.resolve(`tree-sitter-wasms/out/${BASH_GRAMMAR}`),
+    );
+  })();
+  return languagePromise;
 }
 
-async function loadLanguage(grammar: string): Promise<Language> {
-  let promise = languagePromises.get(grammar);
-  if (!promise) {
-    promise = (async () => {
-      await initializeRuntime();
-      return Language.load(require.resolve(`tree-sitter-wasms/out/${grammar}`));
-    })();
-    languagePromises.set(grammar, promise);
-  }
-  return promise;
-}
-
-/** Parse with deterministic cleanup. Tree-sitter nodes must not escape the callback. */
-export async function withParsedTree<T>(
-  grammar: string,
+/** Parse Bash with deterministic cleanup. Tree-sitter nodes must not escape the callback. */
+export async function withParsedBashTree<T>(
   source: string,
   fn: (tree: Tree) => T | Promise<T>,
 ): Promise<T> {
-  const language = await loadLanguage(grammar);
+  const language = await loadBashLanguage();
   const parser = new Parser();
   let tree: Tree | null = null;
   try {
     parser.setLanguage(language);
     tree = parser.parse(source);
-    if (!tree) throw new Error(`tree-sitter failed to parse with ${grammar}`);
+    if (!tree) throw new Error("tree-sitter failed to parse Bash");
     return await fn(tree);
   } finally {
     tree?.delete();

@@ -157,46 +157,109 @@ export async function resolveBashPathIdentity(
   return identity(isAbsolute(value) ? resolve(value) : resolve(cwd, value));
 }
 
-function identityInside(value: PathIdentity, root: string): boolean {
-  return pathForms(root).some(
+export interface PathPolicyContext {
+  readonly cwd: string;
+  formsFor(path: string): readonly string[];
+  tempRoots(): readonly string[];
+  protectedRoots(): Readonly<Record<"pi-agent" | "codex", string>>;
+  workspaceIdentity(): Promise<PathIdentity>;
+  homeIdentity(): Promise<PathIdentity>;
+}
+
+/** Cache only stable roots for one policy evaluation; target identities remain fresh. */
+export function createPathPolicyContext(cwd: string): PathPolicyContext {
+  const forms = new Map<string, readonly string[]>();
+  let tempRoots: readonly string[] | undefined;
+  let protectedRoots: Readonly<Record<"pi-agent" | "codex", string>> | undefined;
+  let workspacePromise: Promise<PathIdentity> | undefined;
+  let homePromise: Promise<PathIdentity> | undefined;
+
+  return {
+    cwd,
+    formsFor(path) {
+      const logical = resolve(path);
+      const cached = forms.get(logical);
+      if (cached) return cached;
+      const value = pathForms(logical);
+      forms.set(logical, value);
+      return value;
+    },
+    tempRoots() {
+      return tempRoots ??= tempRootPaths();
+    },
+    protectedRoots() {
+      return protectedRoots ??= protectedWriteRootPaths();
+    },
+    workspaceIdentity() {
+      return workspacePromise ??= resolveToolPathIdentity(cwd, cwd);
+    },
+    homeIdentity() {
+      return homePromise ??= resolveToolPathIdentity(homedir(), cwd);
+    },
+  };
+}
+
+function identityInside(
+  value: PathIdentity,
+  root: string,
+  context: PathPolicyContext,
+): boolean {
+  return context.formsFor(root).some(
     (form) => isInside(form, value.logical) || isInside(form, value.canonical),
   );
 }
 
-function identityMatches(value: PathIdentity, path: string): boolean {
-  return pathForms(path).some(
+function identityMatches(
+  value: PathIdentity,
+  path: string,
+  context: PathPolicyContext,
+): boolean {
+  return context.formsFor(path).some(
     (form) => form === value.logical || form === value.canonical,
   );
 }
 
-function identityCovers(value: PathIdentity, path: string): boolean {
-  return pathForms(path).some(
+function identityCovers(
+  value: PathIdentity,
+  path: string,
+  context: PathPolicyContext,
+): boolean {
+  return context.formsFor(path).some(
     (form) => isInside(value.logical, form) || isInside(value.canonical, form),
   );
 }
 
-export function isTempPath(value: PathIdentity): boolean {
-  return tempRootPaths().some((root) =>
-    pathForms(root).some((form) => isInside(form, value.canonical)),
+export function isTempPath(
+  value: PathIdentity,
+  context: PathPolicyContext,
+): boolean {
+  return context.tempRoots().some((root) =>
+    context.formsFor(root).some((form) => isInside(form, value.canonical)),
   );
 }
 
 export function protectedRootForPath(
   value: PathIdentity,
+  context: PathPolicyContext,
 ): { id: "pi-agent" | "codex"; path: string } | undefined {
-  const roots = protectedWriteRootPaths();
+  const roots = context.protectedRoots();
   for (const id of ["pi-agent", "codex"] as const) {
-    if (identityInside(value, roots[id])) return { id, path: roots[id] };
+    if (identityInside(value, roots[id], context)) return { id, path: roots[id] };
   }
   return undefined;
 }
 
-export function isCredentialPath(value: PathIdentity): boolean {
+export function isCredentialPath(
+  value: PathIdentity,
+  context: PathPolicyContext,
+): boolean {
   const home = resolve(homedir());
   const roots = [resolve(home, ".ssh"), resolve(home, ".gnupg"), resolve(home, ".aws")];
-  if (roots.some((root) => identityInside(value, root) || identityCovers(value, root))) return true;
+  if (roots.some((root) =>
+    identityInside(value, root, context) || identityCovers(value, root, context)
+  )) return true;
 
-  const protectedRoots = protectedWriteRootPaths();
+  const protectedRoots = context.protectedRoots();
   const files = [
     resolve(home, ".netrc"),
     resolve(home, ".npmrc"),
@@ -208,18 +271,20 @@ export function isCredentialPath(value: PathIdentity): boolean {
     resolve(protectedRoots["pi-agent"], "auth.json"),
     resolve(protectedRoots.codex, "auth.json"),
   ];
-  return files.some((file) => identityMatches(value, file) || identityCovers(value, file));
+  return files.some((file) =>
+    identityMatches(value, file, context) || identityCovers(value, file, context)
+  );
 }
 
 /** Mirrors the base Bash sandbox: temp plus cwd subtree, except when cwd is HOME. */
 export async function isDefaultSandboxWritable(
   value: PathIdentity,
-  cwd: string,
+  context: PathPolicyContext,
 ): Promise<boolean> {
-  if (isTempPath(value)) return true;
-  if (protectedRootForPath(value)) return false;
-  const cwdIdentity = await resolveToolPathIdentity(cwd, cwd);
-  const homeIdentity = await resolveToolPathIdentity(homedir(), cwd);
+  if (isTempPath(value, context)) return true;
+  if (protectedRootForPath(value, context)) return false;
+  const cwdIdentity = await context.workspaceIdentity();
+  const homeIdentity = await context.homeIdentity();
   if (cwdIdentity.canonical === homeIdentity.canonical) return false;
   return isInside(cwdIdentity.canonical, value.canonical);
 }

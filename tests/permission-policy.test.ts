@@ -19,6 +19,7 @@ const cwd = `${root}/workspace`;
 const protectedRoot = `${root}/pi-agent`;
 const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 const originalCodexHome = process.env.CODEX_HOME;
+const originalPath = process.env.PATH;
 
 beforeEach(() => {
   rmSync(root, { recursive: true, force: true });
@@ -34,6 +35,8 @@ afterEach(() => {
   else process.env.PI_CODING_AGENT_DIR = originalPiAgentDir;
   if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = originalCodexHome;
+  if (originalPath === undefined) delete process.env.PATH;
+  else process.env.PATH = originalPath;
 });
 
 function request(toolName: string, input: Record<string, unknown>, requestCwd = cwd): PermissionRequest {
@@ -64,6 +67,24 @@ describe("permission policy", () => {
       expect(result.decision).toBe("allow");
       expect(result.ruleId).toBe("safe-static-shell");
     }
+  });
+
+  test("does not cache trusted command resolution across policy evaluations", async () => {
+    const command = "ls";
+    const analyses = await bashAnalysis(command);
+
+    process.env.PATH = "/nonexistent";
+    expect(await evaluatePolicy(
+      request("bash", { command }),
+      analyses,
+    )).toMatchObject({ decision: "review", ruleId: "unrecognized-shell-command" });
+
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    expect(await evaluatePolicy(
+      request("bash", { command }),
+      analyses,
+    )).toMatchObject({ decision: "allow", ruleId: "safe-static-shell" });
   });
 
   test("requires human review when Bash analysis is unavailable", async () => {
@@ -158,6 +179,26 @@ describe("permission policy", () => {
     });
   });
 
+  test("does not cache target identities across policy evaluations", async () => {
+    const link = `${root}/moving-link`;
+    symlinkSync(`${cwd}/inside.txt`, link);
+    expect(await evaluatePolicy(
+      request("write", { path: link, content: "x" }),
+      [],
+    )).toMatchObject({ decision: "allow" });
+
+    rmSync(link);
+    symlinkSync(`${homedir()}/outside.txt`, link);
+    expect(await evaluatePolicy(
+      request("write", { path: link, content: "x" }),
+      [],
+    )).toMatchObject({
+      decision: "review",
+      route: "model-then-human",
+      ruleId: "outside-workspace-write",
+    });
+  });
+
   test("does not auto-allow HOME as a workspace", async () => {
     const result = await evaluatePolicy(
       request("write", { path: `${homedir()}/ordinary-file`, content: "x" }, homedir()),
@@ -172,13 +213,20 @@ describe("permission policy", () => {
 
   test("denies Bash writes outside the sandbox", async () => {
     const target = `${homedir()}/permission-outside-${process.pid}.txt`;
-    const command = `touch ${target}`;
-    const result = await evaluatePolicy(request("bash", { command }), await bashAnalysis(command));
-    expect(result).toMatchObject({
-      decision: "deny",
-      ruleId: "bash-outside-sandbox-write-disallowed",
-    });
-    expect(result.reason).toContain("use write or edit");
+    for (const command of [
+      `touch ${target}`,
+      `touch ${cwd}/inside.txt ${target}`,
+    ]) {
+      const result = await evaluatePolicy(
+        request("bash", { command }),
+        await bashAnalysis(command),
+      );
+      expect(result).toMatchObject({
+        decision: "deny",
+        ruleId: "bash-outside-sandbox-write-disallowed",
+      });
+      expect(result.reason).toContain("use write or edit");
+    }
   });
 
   test("denies Bash deletion and directs the model to trash", async () => {

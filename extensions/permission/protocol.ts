@@ -12,14 +12,14 @@ export type PermissionReviewRoute = "model-then-human" | "human";
 export type ReviewerDecision = "allow" | "require-human" | "unavailable";
 
 export interface PermissionRequest {
-  toolCallId: string;
+  readonly toolCallId: string;
   /** Normalized tool name. MCP proxy calls become `mcp:<inner-tool>`. */
-  toolName: string;
+  readonly toolName: string;
   /** Original Pi tool name before normalization. */
-  originalToolName: string;
-  input: Readonly<Record<string, unknown>>;
-  cwd: string;
-  source: "pi" | "mcp";
+  readonly originalToolName: string;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly cwd: string;
+  readonly source: "pi" | "mcp";
 }
 
 export interface PermissionAnalysisResult {
